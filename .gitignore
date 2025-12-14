@@ -1,0 +1,20 @@
+# Build artifacts
+/build/
+*.bin
+*.elf
+*.map
+idf_py_*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
