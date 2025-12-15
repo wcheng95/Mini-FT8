@@ -192,7 +192,8 @@ void stream_wav_task(void* arg) {
           delete d;
           vTaskDelete(nullptr);
         };
-        if (xTaskCreatePinnedToCore(decode_task, "decode_core0", 8192, p, 6, nullptr, 0) != pdPASS) {
+        // Run decode on core1 at lower priority than UI to avoid starving BLE core0.
+        if (xTaskCreatePinnedToCore(decode_task, "decode_core1", 8192, p, 4, nullptr, 1) != pdPASS) {
           ESP_LOGE(TAG_STREAM, "Failed to start decode task");
           delete p;
           break;

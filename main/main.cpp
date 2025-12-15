@@ -15,6 +15,7 @@ extern "C" {
 #include <string>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_heap_caps.h"
 #include "tx_queue.h"
 #include <M5Cardputer.h>
@@ -33,9 +34,178 @@ extern "C" {
 #include <ctime>
 #include "esp_timer.h"
 #include "stream_wav.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "nvs_flash.h"
+#include "soc/soc_caps.h"
+#include "esp_bt.h"
 #ifndef FT8_SAMPLE_RATE
 #define FT8_SAMPLE_RATE 12000
 #endif
+
+#define UART_SVC_UUID   0xFFE0
+#define UART_RX_UUID    0xFFE1
+#define UART_TX_UUID    0xFFE2
+
+static const ble_uuid16_t uart_svc_uuid =
+    BLE_UUID16_INIT(UART_SVC_UUID);
+static const ble_uuid16_t uart_rx_uuid =
+    BLE_UUID16_INIT(UART_RX_UUID);
+static const ble_uuid16_t uart_tx_uuid =
+    BLE_UUID16_INIT(UART_TX_UUID);
+
+
+static QueueHandle_t ble_rx_queue = nullptr;
+static uint16_t gatt_tx_handle = 0;
+static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static const char* BT_TAG = "BLE_INIT";
+
+static int gap_cb(struct ble_gap_event *event, void *arg);
+static void nimble_host_task(void *param);
+static void ble_on_sync(void);
+
+// RX write callback (ok as you have)
+static int uart_rx_cb(uint16_t conn_handle,
+                      uint16_t attr_handle,
+                      struct ble_gatt_access_ctxt *ctxt,
+                      void *arg)
+{
+    if (!ble_rx_queue) return 0;
+    ESP_LOGI(BT_TAG, "RX write cb: conn=%u len=%u", conn_handle, (unsigned)ctxt->om->om_len);
+    const uint8_t *p = ctxt->om->om_data;
+    uint16_t len = ctxt->om->om_len;
+    for (uint16_t i = 0; i < len; i++) {
+        uint8_t b = p[i];
+        xQueueSend(ble_rx_queue, &b, 0);
+    }
+    return 0;
+}
+
+// TX characteristic doesn't need reads/writes; return success.
+static int uart_tx_cb(uint16_t conn_handle,
+                      uint16_t attr_handle,
+                      struct ble_gatt_access_ctxt *ctxt,
+                      void *arg)
+{
+    return 0;
+}
+
+#include "esp_nimble_hci.h"   // <-- add
+
+// C++-safe static characteristics table
+static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
+    {
+        .uuid = &uart_rx_uuid.u,
+        .access_cb = uart_rx_cb,
+        .arg = nullptr,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {
+        .uuid = &uart_tx_uuid.u,              // <-- IMPORTANT: no BLE_UUID16_DECLARE here
+        .access_cb = uart_tx_cb,
+        .arg = nullptr,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &gatt_tx_handle,  // CCCD will follow
+    },
+    { 0 }  // terminator
+};
+
+// C++-safe service table
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &uart_svc_uuid.u,
+        .characteristics = gatt_uart_chrs,
+    },
+    { 0 }  // terminator
+};
+
+static void init_bluetooth(void)
+{
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+    ESP_LOGI(BT_TAG, "init_bluetooth start");
+
+    esp_err_t nvrc = nvs_flash_init();
+    if (nvrc == ESP_ERR_NVS_NO_FREE_PAGES || nvrc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvrc = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvrc);
+
+    int rc = nimble_port_init();
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "nimble_port_init failed: %d", rc);
+        return;
+    }
+    ESP_LOGI(BT_TAG, "nimble_port_init OK");
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ESP_LOGI(BT_TAG, "GAP/GATT init done");
+
+    ble_rx_queue = xQueueCreate(256, 1);
+    assert(ble_rx_queue);
+
+    ble_svc_gap_device_name_set("Mini-FT8");
+
+    rc = ble_gatts_count_cfg(gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "ble_gatts_count_cfg failed: %d", rc);
+        return;
+    }
+    rc = ble_gatts_add_svcs(gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
+        return;
+    }
+    ESP_LOGI(BT_TAG, "Services added");
+
+    ble_hs_cfg.sync_cb = ble_on_sync;
+
+    nimble_port_freertos_init(nimble_host_task);
+    ESP_LOGI(BT_TAG, "Host task started");
+}
+
+
+static void ble_app_advertise(void);
+
+static int gap_cb(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            g_conn_handle = event->connect.conn_handle;
+            ESP_LOGI(BT_TAG, "GAP connect, handle=%u", g_conn_handle);
+        } else {
+            g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            ESP_LOGW(BT_TAG, "GAP connect failed; restarting adv");
+            ble_app_advertise();
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        ESP_LOGW(BT_TAG, "GAP disconnect; restarting adv");
+        ble_app_advertise();
+        break;
+
+    default:
+        ESP_LOGI(BT_TAG, "GAP event type=%d", event->type);
+        break;
+    }
+    return 0;
+}
+
+
+// BLE UART-style service (Nordic-like) UUIDs
+[[maybe_unused]] static uint8_t ble_rx_placeholder = 0;
+[[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
 
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, DEBUG, LIST, STATUS };
@@ -67,12 +237,15 @@ static std::string g_time = "10:10:00";
 static int status_edit_idx = -1;     // 0-5
 static std::string status_edit_buffer;
 static int status_cursor_pos = -1;
+static void host_send_bt(const std::string& s);
 static std::vector<std::string> g_debug_lines;
 static int debug_page = 0;
 static const size_t DEBUG_MAX_LINES = 18; // 3 pages
 static void debug_log_line(const std::string& msg);
 static void host_handle_line(const std::string& line);
+static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
+static void poll_ble_uart();
 static void enter_mode(UIMode new_mode);
 static bool g_rx_dirty = false;
 static std::vector<std::string> g_list_lines = {
@@ -151,6 +324,7 @@ int64_t rtc_now_ms();
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+static uint8_t g_own_addr_type;
 
 static void ensure_usb() {
   if (usb_ready) return;
@@ -165,8 +339,10 @@ static void ensure_usb() {
 
 static void host_write_str(const std::string& s) {
   ensure_usb();
-  if (!usb_ready) return;
-  usb_serial_jtag_write_bytes((const uint8_t*)s.data(), s.size(), 0);
+  if (usb_ready) {
+    usb_serial_jtag_write_bytes((const uint8_t*)s.data(), s.size(), 0);
+  }
+  host_send_bt(s);
 }
 
 struct WAVHeader {
@@ -737,6 +913,73 @@ static void debug_log_line(const std::string& msg) {
   }
 }
 
+static void host_send_bt(const std::string& s)
+{
+    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    if (!gatt_tx_handle) return;
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(s.data(), s.size());
+    if (!om) return;
+
+    ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
+}
+
+static void ble_on_sync(void);
+
+static void ble_on_sync(void)
+{
+    int rc = ble_hs_util_ensure_addr(0);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "ensure addr failed: %d", rc);
+        return;
+    }
+    rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "infer auto addr failed: %d", rc);
+        return;
+    }
+    uint8_t addr_val[6];
+    ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
+    ESP_LOGI(BT_TAG, "Sync, address type %d, addr %02x:%02x:%02x:%02x:%02x:%02x",
+             g_own_addr_type,
+             addr_val[5], addr_val[4], addr_val[3], addr_val[2], addr_val[1], addr_val[0]);
+    ble_app_advertise();
+}
+
+static void nimble_host_task(void *param)
+{
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void ble_app_advertise(void)
+{
+    struct ble_gap_adv_params adv{};
+    adv.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    struct ble_hs_adv_fields fields{};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t*)"Mini-FT8";
+    fields.name_len = strlen("Mini-FT8");
+    fields.name_is_complete = 1;
+
+    ble_gap_adv_stop();  // safe if not advertising
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
+        return;
+    }
+    rc = ble_gap_adv_start(g_own_addr_type, nullptr,
+                           BLE_HS_FOREVER,
+                           &adv, gap_cb, nullptr);
+    if (rc != 0) {
+        ESP_LOGE(BT_TAG, "adv_start failed: %d", rc);
+    } else {
+        ESP_LOGI(BT_TAG, "Advertising as Mini-FT8");
+    }
+}
+
 static std::string trim_copy(const std::string& s) {
   size_t b = 0, e = s.size();
   while (b < e && isspace((unsigned char)s[b])) ++b;
@@ -778,7 +1021,7 @@ static void host_handle_line(const std::string& line_in) {
   bool send_prompt = true;
   std::string line = trim_copy(line_in);
   if (line.empty()) { host_write_str(HOST_PROMPT); return; }
-  debug_log_line(std::string("[USB RX] ") + line);
+  debug_log_line(std::string("[HOST RX] ") + line);
   std::string echo = std::string("ECHO: ") + line + "\r\n";
   host_write_str(echo);
 
@@ -893,97 +1136,92 @@ static void host_handle_line(const std::string& line_in) {
   if (send_prompt) host_write_str(std::string(HOST_PROMPT));
 }
 
-static void poll_host_uart() {
-  ensure_usb();
-  if (!usb_ready) return;
-  uint8_t buf[512];
-  while (true) {
-    int r = usb_serial_jtag_read_bytes(buf, sizeof(buf), 0);
-    if (r <= 0) break;
-    for (int i = 0; i < r; ) {
-      if (host_bin_active) {
-        // Skip any stray CR/LF before first payload byte
-        if (host_bin_received == 0 && host_bin_buf.empty() && (buf[i] == '\r' || buf[i] == '\n')) {
-          ++i;
+static void host_process_bytes(const uint8_t* buf, size_t len) {
+  ESP_LOGI(BT_TAG, "host_process_bytes len=%u", (unsigned)len);
+  for (size_t i = 0; i < len; ) {
+    if (host_bin_active) {
+      // Skip any stray CR/LF before first payload byte
+      if (host_bin_received == 0 && host_bin_buf.empty() && (buf[i] == '\r' || buf[i] == '\n')) {
+        ++i;
+        continue;
+      }
+      size_t payload_need = host_bin_chunk_expect;
+      size_t total_need = payload_need + 4; // payload + crc32 trailer
+      size_t avail = len - i;
+      size_t copy = total_need - host_bin_buf.size();
+      if (copy > avail) copy = avail;
+      host_bin_buf.insert(host_bin_buf.end(), buf + i, buf + i + copy);
+      i += copy;
+
+      if (host_bin_buf.size() >= total_need) {
+        size_t payload_len = payload_need;
+        uint32_t recv_crc = (uint32_t(host_bin_buf[payload_len])) |
+                            (uint32_t(host_bin_buf[payload_len + 1]) << 8) |
+                            (uint32_t(host_bin_buf[payload_len + 2]) << 16) |
+                            (uint32_t(host_bin_buf[payload_len + 3]) << 24);
+        uint32_t calc_crc = crc32_update(0, host_bin_buf.data(), payload_len);
+        if (calc_crc != recv_crc) {
+          char dbg[128];
+          snprintf(dbg, sizeof(dbg), "ERROR: chunk crc off=%u len=%u calc=%08X recv=%08X\r\n",
+                   (unsigned)(host_bin_received + payload_len), (unsigned)payload_len,
+                   (unsigned)calc_crc, (unsigned)recv_crc);
+          host_write_str(std::string(dbg));
+          // Send first/last bytes of the chunk to compare
+          if (payload_len >= 8) host_debug_hex8("DBG CHUNK FIRST8", host_bin_buf.data());
+          if (payload_len >= 8) host_debug_hex8("DBG CHUNK LAST8", host_bin_buf.data() + payload_len - 8);
+          if (payload_len < 8) host_debug_hex8("DBG CHUNK PART", host_bin_buf.data());
+          // Also report the CRC trailer bytes as seen
+          uint8_t crc_bytes[4] = {
+            host_bin_buf[payload_len],
+            host_bin_buf[payload_len + 1],
+            host_bin_buf[payload_len + 2],
+            host_bin_buf[payload_len + 3]
+          };
+          host_debug_hex8("DBG CRC BYTES", crc_bytes);
+          fclose(host_bin_fp);
+          host_bin_fp = nullptr;
+          host_bin_active = false;
+          host_bin_remaining = 0;
+          host_bin_buf.clear();
+          host_write_str(std::string(HOST_PROMPT));
           continue;
         }
-        size_t payload_need = host_bin_chunk_expect;
-        size_t total_need = payload_need + 4; // payload + crc32 trailer
-        size_t avail = (size_t)(r - i);
-        size_t copy = total_need - host_bin_buf.size();
-        if (copy > avail) copy = avail;
-        host_bin_buf.insert(host_bin_buf.end(), buf + i, buf + i + copy);
-        i += (int)copy;
 
-        if (host_bin_buf.size() >= total_need) {
-          size_t payload_len = payload_need;
-          uint32_t recv_crc = (uint32_t(host_bin_buf[payload_len])) |
-                              (uint32_t(host_bin_buf[payload_len + 1]) << 8) |
-                              (uint32_t(host_bin_buf[payload_len + 2]) << 16) |
-                              (uint32_t(host_bin_buf[payload_len + 3]) << 24);
-          uint32_t calc_crc = crc32_update(0, host_bin_buf.data(), payload_len);
-          if (calc_crc != recv_crc) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "ERROR: chunk crc off=%u len=%u calc=%08X recv=%08X\r\n",
-                     (unsigned)(host_bin_received + payload_len), (unsigned)payload_len,
-                     (unsigned)calc_crc, (unsigned)recv_crc);
-            host_write_str(std::string(dbg));
-            // Send first/last bytes of the chunk to compare
-            if (payload_len >= 8) host_debug_hex8("DBG CHUNK FIRST8", host_bin_buf.data());
-            if (payload_len >= 8) host_debug_hex8("DBG CHUNK LAST8", host_bin_buf.data() + payload_len - 8);
-            if (payload_len < 8) host_debug_hex8("DBG CHUNK PART", host_bin_buf.data());
-            // Also report the CRC trailer bytes as seen
-            uint8_t crc_bytes[4] = {
-              host_bin_buf[payload_len],
-              host_bin_buf[payload_len + 1],
-              host_bin_buf[payload_len + 2],
-              host_bin_buf[payload_len + 3]
-            };
-            host_debug_hex8("DBG CRC BYTES", crc_bytes);
-            fclose(host_bin_fp);
-            host_bin_fp = nullptr;
-            host_bin_active = false;
-            host_bin_remaining = 0;
-            host_bin_buf.clear();
-            host_write_str(std::string(HOST_PROMPT));
-            continue;
+        // Capture first/last bytes for debugging
+        if (host_bin_first_filled < 8) {
+          size_t need = 8 - host_bin_first_filled;
+          if (need > payload_len) need = payload_len;
+          memcpy(host_bin_first8 + host_bin_first_filled, host_bin_buf.data(), need);
+          host_bin_first_filled += need;
+        }
+        // update last8 buffer
+        if (payload_len >= 8) {
+          memcpy(host_bin_last8, host_bin_buf.data() + payload_len - 8, 8);
+        } else {
+          // shift existing and append
+          size_t shift = (payload_len + 8 > 8) ? (payload_len) : payload_len;
+          if (shift > 0) {
+            memmove(host_bin_last8, host_bin_last8 + shift, 8 - shift);
+            memcpy(host_bin_last8 + (8 - payload_len), host_bin_buf.data(), payload_len);
           }
+        }
 
-          // Capture first/last bytes for debugging
-          if (host_bin_first_filled < 8) {
-            size_t need = 8 - host_bin_first_filled;
-            if (need > payload_len) need = payload_len;
-            memcpy(host_bin_first8 + host_bin_first_filled, host_bin_buf.data(), need);
-            host_bin_first_filled += need;
-          }
-          // update last8 buffer
-          if (payload_len >= 8) {
-            memcpy(host_bin_last8, host_bin_buf.data() + payload_len - 8, 8);
-          } else {
-            // shift existing and append
-            size_t shift = (payload_len + 8 > 8) ? (payload_len) : payload_len;
-            if (shift > 0) {
-              memmove(host_bin_last8, host_bin_last8 + shift, 8 - shift);
-              memcpy(host_bin_last8 + (8 - payload_len), host_bin_buf.data(), payload_len);
-            }
-          }
-
-          size_t written = fwrite(host_bin_buf.data(), 1, payload_len, host_bin_fp);
-          if (written != payload_len) {
-            host_write_str("ERROR: write failed\r\n");
-            fclose(host_bin_fp);
-            host_bin_fp = nullptr;
-            host_bin_active = false;
-            host_bin_remaining = 0;
-            host_bin_buf.clear();
-            host_write_str(std::string(HOST_PROMPT));
-            continue;
-          }
-          host_bin_crc = crc32_update(host_bin_crc, host_bin_buf.data(), payload_len);
-          host_bin_remaining -= payload_len;
-          host_bin_received += payload_len;
+        size_t written = fwrite(host_bin_buf.data(), 1, payload_len, host_bin_fp);
+        if (written != payload_len) {
+          host_write_str("ERROR: write failed\r\n");
+          fclose(host_bin_fp);
+          host_bin_fp = nullptr;
+          host_bin_active = false;
+          host_bin_remaining = 0;
           host_bin_buf.clear();
-          host_write_str("ACK " + std::to_string(host_bin_received) + "\r\n");
+          host_write_str(std::string(HOST_PROMPT));
+          continue;
+        }
+        host_bin_crc = crc32_update(host_bin_crc, host_bin_buf.data(), payload_len);
+        host_bin_remaining -= payload_len;
+        host_bin_received += payload_len;
+        host_bin_buf.clear();
+        host_write_str("ACK " + std::to_string(host_bin_received) + "\r\n");
 
         if (host_bin_remaining == 0) {
           fclose(host_bin_fp);
@@ -1008,20 +1246,59 @@ static void poll_host_uart() {
         }
       }
       continue;
+    }
+    char ch = (char)buf[i++];
+    if (ch == '\r' || ch == '\n') {
+      if (!host_input.empty()) {
+        ESP_LOGI(BT_TAG, "HOST line: %s", host_input.c_str());
+        host_handle_line(host_input);
+        host_input.clear();
+      } else {
+        host_write_str(std::string(HOST_PROMPT));
       }
-      char ch = (char)buf[i++];
-      if (ch == '\r' || ch == '\n') {
-        if (!host_input.empty()) {
-          host_handle_line(host_input);
-          host_input.clear();
-        } else {
-          host_write_str(std::string(HOST_PROMPT));
-        }
-      } else if (ch == 0x08 || ch == 0x7f) {
-        if (!host_input.empty()) host_input.pop_back();
-      } else if (ch >= 32 && ch < 127) {
-        host_input.push_back(ch);
+    } else if (ch == 0x08 || ch == 0x7f) {
+      if (!host_input.empty()) host_input.pop_back();
+    } else if (ch >= 32 && ch < 127) {
+      host_input.push_back(ch);
+    }
+  }
+}
+
+static void poll_host_uart() {
+  ensure_usb();
+  if (!usb_ready) return;
+  uint8_t buf[512];
+  while (true) {
+    int r = usb_serial_jtag_read_bytes(buf, sizeof(buf), 0);
+    if (r <= 0) break;
+    host_process_bytes(buf, (size_t)r);
+  }
+}
+
+static void poll_ble_uart() {
+  if (!ble_rx_queue) return;
+  uint8_t buf[256];
+  size_t n = 0;
+  uint8_t b = 0;
+  while (xQueueReceive(ble_rx_queue, &b, 0) == pdTRUE) {
+    buf[n++] = b;
+    if (n == sizeof(buf)) {
+      ESP_LOGI(BT_TAG, "BLE RX chunk %u bytes", (unsigned)n);
+      host_process_bytes(buf, n);
+      // If no newline was seen, synthesize one to flush short commands over BLE.
+      if (!host_bin_active && n > 0 && buf[n - 1] != '\n' && buf[n - 1] != '\r') {
+        const uint8_t nl = '\n';
+        host_process_bytes(&nl, 1);
       }
+      n = 0;
+    }
+  }
+  if (n > 0) {
+    ESP_LOGI(BT_TAG, "BLE RX chunk %u bytes", (unsigned)n);
+    host_process_bytes(buf, n);
+    if (!host_bin_active && buf[n - 1] != '\n' && buf[n - 1] != '\r') {
+      const uint8_t nl = '\n';
+      host_process_bytes(&nl, 1);
     }
   }
 }
@@ -1216,9 +1493,10 @@ static void app_task_core1(void* /*param*/) {
     rtc_tick();
     update_countdown();
 
-    // HOST mode: always service USB input; only react to 'h'/'H' to exit
+  // HOST mode: always service USB input; only react to 'h'/'H' to exit
   if (ui_mode == UIMode::HOST) {
     poll_host_uart();
+    poll_ble_uart();
     if (host_bin_active) { // block keyboard exits during binary upload
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -1586,8 +1864,9 @@ static void app_task_core1(void* /*param*/) {
 }
 
 extern "C" void app_main(void) {
-  // Run the full application loop on core1; decoder work stays on core0.
+  // Run the main application loop on core1; BLE host stays on core0.
   xTaskCreatePinnedToCore(app_task_core1, "app_core1", 12288, nullptr, 5, nullptr, 1);
+  init_bluetooth();   // runs on core0
 }
 static void draw_status_line(int idx, const std::string& text, bool highlight) {
   const int line_h = 19;
