@@ -40,4 +40,4 @@ Software RTC settable in Status page; ticks independently of GPS; used for slot 
 
 - USB is dual-role; you must switch roles (don’t host and connect to PC simultaneously).
 - Battery line shows percent and icon; charging indicated with bolt and “CHG”.
-
+- dot -Tpng -Gdpi=200 flow.dot -o flow.png `choco install graphviz`
