@@ -248,6 +248,7 @@ static void poll_host_uart();
 static void poll_ble_uart();
 static void enter_mode(UIMode new_mode);
 static bool g_rx_dirty = false;
+
 static std::vector<std::string> g_list_lines = {
     "10:34 20m WA4HR",
     "10:36 40m K4ABC",
@@ -1446,7 +1447,7 @@ static void enter_mode(UIMode new_mode) {
   }
 }
 
-static void app_task_core1(void* /*param*/) {
+static void app_task_core0(void* /*param*/) {
   esp_vfs_spiffs_conf_t conf = {
     .base_path = "/spiffs",
     .partition_label = NULL,
@@ -1456,7 +1457,6 @@ static void app_task_core1(void* /*param*/) {
   ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
 
   ui_init();
-  ui_draw_waterfall();
   std::vector<UiRxLine> empty;
   ui_set_rx_list(empty);
   ui_draw_rx();
@@ -1525,6 +1525,7 @@ static void app_task_core1(void* /*param*/) {
         ui_draw_rx(rx_flash_idx);
         g_rx_dirty = false;
       }
+      ui_draw_waterfall_if_dirty();
       menu_flash_tick();
       rx_flash_tick();
       last_key = 0;
@@ -1532,6 +1533,7 @@ static void app_task_core1(void* /*param*/) {
       continue;
     }
   if (c == last_key) {
+    ui_draw_waterfall_if_dirty();
     vTaskDelay(pdMS_TO_TICKS(10));
     continue;
   }
@@ -1554,12 +1556,11 @@ static void app_task_core1(void* /*param*/) {
   try_start_stream(c);
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
-    ui_set_rx_list(g_rx_lines);
-    ui_draw_rx(rx_flash_idx);
-    g_rx_dirty = false;
-    rx_flash_idx = -1;
-    rx_flash_deadline = 0;
+      ui_set_rx_list(g_rx_lines);
+      ui_draw_rx(rx_flash_idx);
+      g_rx_dirty = false;
   }
+  ui_draw_waterfall_if_dirty();
 
   bool switched = false;
   auto cancel_status_edit = []() {
@@ -1864,8 +1865,8 @@ static void app_task_core1(void* /*param*/) {
 }
 
 extern "C" void app_main(void) {
-  // Run the main application loop on core1; BLE host stays on core0.
-  xTaskCreatePinnedToCore(app_task_core1, "app_core1", 12288, nullptr, 5, nullptr, 1);
+  // Run the main application loop on core0; BLE host stays on core0.
+  xTaskCreatePinnedToCore(app_task_core0, "app_core0", 12288, nullptr, 5, nullptr, 0);
   init_bluetooth();   // runs on core0
 }
 static void draw_status_line(int idx, const std::string& text, bool highlight) {
@@ -1873,13 +1874,11 @@ static void draw_status_line(int idx, const std::string& text, bool highlight) {
   const int start_y = 18 + 3 + 3; // WATERFALL_H + COUNTDOWN_H + gap
   int y = start_y + idx * line_h;
   uint16_t bg = highlight ? M5.Display.color565(30, 30, 60) : TFT_BLACK;
-  M5.Display.startWrite();
   M5.Display.setTextSize(2);
   M5.Display.fillRect(0, y, 240, line_h, bg);
   M5.Display.setTextColor(TFT_WHITE, bg);
   M5.Display.setCursor(0, y);
   M5.Display.printf("%d %s", idx + 1, text.c_str());
-  M5.Display.endWrite();
 }
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging) {
   if (level < 0) level = 0;
@@ -1906,3 +1905,5 @@ static void draw_battery_icon(int x, int y, int w, int h, int level, bool chargi
   }
   M5.Display.endWrite();
 }
+
+

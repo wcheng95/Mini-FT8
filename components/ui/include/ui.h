@@ -13,11 +13,15 @@ struct UiRxLine {
 
 void ui_init();
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
-// Push a new row into the waterfall ring buffer (advances head) and redraws it.
+// Push a new row into the waterfall ring buffer (advances head). UI task must flush.
 void ui_push_waterfall_row(const uint8_t* bins, int len);
 void ui_draw_waterfall();
+void ui_draw_waterfall_if_dirty();
+bool ui_waterfall_dirty();
 void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar
 void ui_set_rx_list(const std::vector<UiRxLine>& lines);
+void ui_set_paused(bool paused);
+bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete);

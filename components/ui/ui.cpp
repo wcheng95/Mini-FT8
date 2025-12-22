@@ -10,9 +10,11 @@ static constexpr int SCREEN_H = 135;
 static constexpr int WATERFALL_H = 18;
 static constexpr int COUNTDOWN_H = 3;
 static constexpr int RX_LINES = 6;
+static bool ui_paused = false;
 
 static uint8_t waterfall[WATERFALL_H][SCREEN_W];
 static int waterfall_head = 0;
+static bool waterfall_dirty = false;
 
 static std::vector<UiRxLine> rx_lines;
 static int rx_page = 0;
@@ -42,6 +44,12 @@ struct DispGuard {
 static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
+
+void ui_set_paused(bool paused) { ui_paused = paused; }
+bool ui_is_paused() { return ui_paused; }
+
+bool ui_waterfall_dirty() { return waterfall_dirty; }
+void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
 
 // Draw TX view: line 1 = next, lines 2-6 from queue/page
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete) {
@@ -94,16 +102,19 @@ void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
 }
 
 void ui_push_waterfall_row(const uint8_t* bins, int len) {
+    if (ui_paused) return;
     if (len > SCREEN_W) len = SCREEN_W;
     memcpy(waterfall[waterfall_head], bins, len);
     if (len < SCREEN_W) {
         memset(waterfall[waterfall_head] + len, 0, SCREEN_W - len);
     }
     waterfall_head = (waterfall_head + 1) % WATERFALL_H;
-    ui_draw_waterfall();
+    waterfall_dirty = true;
 }
 
 void ui_draw_waterfall() {
+    waterfall_dirty = false;
+    if (ui_paused) return;
     DispGuard guard;
     int dst_y = 0;
     for (int i = 0; i < WATERFALL_H; ++i) {
@@ -121,6 +132,7 @@ void ui_draw_waterfall() {
 }
 
 void ui_draw_countdown(float fraction, bool even_slot) {
+    if (ui_paused) return;
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
     int filled = (int)(fraction * SCREEN_W);

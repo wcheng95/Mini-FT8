@@ -1,40 +1,22 @@
-digraph mini_ft8 {
+digraph G {
   rankdir=LR;
-  node [shape=box, style=rounded, fontsize=10];
-
+  node [shape=box, style=rounded, fontname="Arial"];
   subgraph cluster_core0 {
-    label="core0";
-    app_main [label="app_main\nspawn app_task_core1"];
-    bt_host [label="BLE host/NimBLE\n(uart svc callbacks)"];
-    decode [label="decode_task\nftx_find_candidates\nftx_decode\nsort to-me/CQ/other\nupdate g_rx_lines\nset g_rx_dirty"];
+    label="Core0";
+    color="#6ca0dc";
+    ui [label="app_task_core0\nUI loop\nkeys/modes\nwaterfall flush\nRTC/countdown"];
+    sys [label="BLE host (NimBLE)\nUSB CDC/JTAG\nNVS/time services"];
   }
-
   subgraph cluster_core1 {
-    label="core1";
-    task_main [label="app_task_core1 loop:\nUI init/draw\nload station data\nrtc_tick/update_countdown\nmenu/rx flash timers\npoll_host_uart/poll_ble_uart\nkey handling/mode switch\nRX dirty -> ui_draw_rx\ntry_start_stream('x')"];
-    stream_wav [label="stream_wav_task\n(wait slot)\nread WAV + AGC\nmonitor_process\npush waterfall\nspawn decode(core0)\nclear g_streaming"];
-    ui [label="UI module\nwaterfall/countdown\nRX/TX/BAND/MENU\nSTATUS/LIST/DEBUG\nDispGuard mutex"];
-    host_user [label="HOST logic\npoll_host_uart\nUSB JTAG driver\nWRITEBIN/READ/LIST/INFO/HELP"];
+    label="Core1";
+    color="#d38b5d";
+    stream [label="stream_wav_task / mic stream\npush waterfall rows"];
+    decode [label="FT8 decode/FFT/DSP"];
   }
-
-  storage [label="SPIFFS\nStationData.ini\nkfs40m.wav"];
-
-  app_main -> task_main;
-  app_main -> bt_host;
-
-  task_main -> stream_wav [label="'x' key\n(g_streaming=true)"];
-  stream_wav -> decode [label="spawn core0"];
-  decode -> task_main [label="g_rx_dirty\nupdate list"];
-
-  task_main -> ui [label="draw calls"];
-  stream_wav -> ui [label="waterfall rows"];
-
-  task_main -> host_user [label="HOST mode\npoll_host_uart"];
-  host_user -> storage [label="Host Command"];
-  task_main -> bt_host [label="poll_ble_uart"];
-
-  task_main -> storage [label="Load/Store settings"];
-  stream_wav -> storage [label="read WAV"];
-
-  ui -> task_main [label="mode/key feedback", style=dashed, dir=back];
+  shared [shape=folder, label="Shared state\nTX/RX queues\nwaterfall buffer\ncountdown/RTC"];
+  ui -> stream [label="start on 'x' when idle"];
+  stream -> decode [label="audio blocks"];
+  stream -> shared [label="waterfall rows (dirty flag)"];
+  decode -> shared [label="RX lines\ncandidates"];
+  shared -> ui [label="draw RX/waterfall\nmenus/status"];
 }
