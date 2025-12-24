@@ -34,6 +34,7 @@ extern "C" {
 #include <ctime>
 #include "esp_timer.h"
 #include "stream_wav.h"
+#include "stream_uac.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -1396,6 +1397,10 @@ static void enter_mode(UIMode new_mode) {
     status_edit_idx = -1;
     status_edit_buffer.clear();
   }
+  // Stop UAC streaming when leaving HOST mode
+  if (ui_mode == UIMode::HOST && new_mode != UIMode::HOST) {
+    uac_stop();
+  }
   ui_mode = new_mode;
   rx_flash_idx = -1;
   switch (ui_mode) {
@@ -1425,15 +1430,19 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_debug(g_debug_lines, debug_page);
       break;
     case UIMode::HOST:
-      ui_draw_list(g_host_lines, 0, -1);
-      host_input.clear();
-      ensure_usb();
-      if (usb_ready) {
-        host_write_str("READY\r\n");
-        host_write_str(std::string(HOST_PROMPT));
+      // Start UAC audio streaming
+      g_host_lines.clear();
+      g_host_lines.push_back("USB Audio Host Mode");
+      g_host_lines.push_back("-------------------");
+      if (uac_start()) {
+        g_host_lines.push_back("Starting USB host...");
+        g_host_lines.push_back("Connect 24-bit/48kHz");
+        g_host_lines.push_back("stereo USB mic");
       } else {
-        debug_log_line("USB serial not ready");
+        g_host_lines.push_back("Failed to start UAC");
+        debug_log_line("UAC start failed");
       }
+      ui_draw_list(g_host_lines, 0, -1);
       break;
     case UIMode::LIST:
       list_page = 0;
@@ -1493,31 +1502,40 @@ static void app_task_core0(void* /*param*/) {
     rtc_tick();
     update_countdown();
 
-  // HOST mode: always service USB input; only react to 'h'/'H' to exit
+  // HOST mode: UAC audio streaming - update status display
   if (ui_mode == UIMode::HOST) {
-    poll_host_uart();
-    poll_ble_uart();
-    if (host_bin_active) { // block keyboard exits during binary upload
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+    // Update status display periodically
+    static TickType_t last_update = 0;
+    TickType_t now = xTaskGetTickCount();
+    if (now - last_update > pdMS_TO_TICKS(500)) {
+      last_update = now;
+      // Update status line
+      if (g_host_lines.size() > 2) {
+        g_host_lines.resize(3);
       }
-      // Keyboard path uses normal repeat suppression; USB path stays always-on
-      if (c == 0) {
-        last_key = 0;
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
+      g_host_lines.push_back(uac_get_status_string());
+      if (uac_is_streaming()) {
+        g_host_lines.push_back("Decoding FT8...");
       }
-      if (c == last_key) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-      last_key = c;
-      if (c == 'h' || c == 'H') {
-        enter_mode(UIMode::RX);
-      }
+      ui_draw_list(g_host_lines, 0, -1);
+    }
+    // Handle keyboard - only 'h'/'H' to exit
+    if (c == 0) {
+      last_key = 0;
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
+    if (c == last_key) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    last_key = c;
+    if (c == 'h' || c == 'H') {
+      enter_mode(UIMode::RX);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    continue;
+  }
 
     if (c == 0) {
       if (g_rx_dirty && ui_mode == UIMode::RX) {

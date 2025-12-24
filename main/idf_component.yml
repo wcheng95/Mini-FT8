@@ -15,3 +15,6 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   lvgl/lvgl: ^8.3.9
+  # USB Host UAC for audio streaming
+  espressif/usb_host_uac: "^1.2.0"
+  espressif/usb: "*"
