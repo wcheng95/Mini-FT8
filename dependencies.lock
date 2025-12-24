@@ -1,4 +1,57 @@
 dependencies:
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/usb:
+    component_hash: f583375dac409f4287f3be9c188e54200b01a5ae774194b3bfee7d67e4e269d0
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - linux
+    version: 1.1.0
+  espressif/usb_host_uac:
+    component_hash: 61be58265c2adf3b9f4429f68f82a548c40659ef561a1ee6841bf21425c50a1c
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.5.*
+    - name: idf
+      require: private
+      version: '>=5.0'
+    - name: espressif/usb
+      registry_url: https://components.espressif.com
+      require: public
+      rules:
+      - if: idf_version >=6.0
+      - if: target not in ["linux"]
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - linux
+    version: 1.3.3
   idf:
     source:
       type: idf
@@ -11,8 +64,10 @@ dependencies:
       type: service
     version: 8.4.0
 direct_dependencies:
+- espressif/usb
+- espressif/usb_host_uac
 - idf
 - lvgl/lvgl
-manifest_hash: 7542b48b9d82dc33743a5aab30ec162f94f5d78c6859a3d0f34d10d09bc61812
+manifest_hash: 2b7b9e8efc61631c8cb890e334111be7e1edd26622c839d58343e5e3e04d6e6a
 target: esp32s3
 version: 2.0.0

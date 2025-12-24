@@ -1,0 +1,23 @@
+dependencies:
+  idf: '>=5.4'
+description: USB Host library
+documentation: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/api-reference/peripherals/usb_host.html
+files:
+  exclude:
+  - test/**/*
+issues: https://github.com/espressif/esp-usb/issues
+repository: git://github.com/espressif/esp-usb.git
+repository_info:
+  commit_sha: a70c39b9c3f74db7fc968f045bc792bb4430c110
+  path: host/usb
+tags:
+- usb
+- usb_host
+targets:
+- esp32s2
+- esp32s3
+- esp32p4
+- esp32h4
+- linux
+url: https://github.com/espressif/esp-usb/tree/master/host/usb
+version: 1.1.0
