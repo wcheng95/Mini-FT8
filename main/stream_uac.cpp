@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 
@@ -33,48 +34,76 @@ static const char* TAG = "UAC_STREAM";
 // Test tone parameters
 #define TEST_TONE_FREQ_HZ   1500    // 1.5 kHz test tone
 #define TEST_TONE_PERIOD    32      // 48000 / 1500 = 32 samples per cycle
-#define TEST_TONE_DB        (-50.0f)  // Amplitude in dB (0 dB = full scale)
+#define TEST_TONE_DB        (-50.0f)  // Tone amplitude in dB (0 dB = full scale)
+#define TEST_NOISE_DB       (-80.0f)  // White noise floor in dB
 #define TEST_TONE_AMPLITUDE (powf(10.0f, TEST_TONE_DB / 20.0f))  // -50dB ≈ 0.00316
+#define TEST_NOISE_AMPLITUDE (powf(10.0f, TEST_NOISE_DB / 20.0f))  // -80dB ≈ 0.0001
 
-// Pre-computed 1.5kHz tone buffer (32 samples, 24-bit stereo = 192 bytes)
-// Format: 24-bit LE stereo (L0 L1 L2 R0 R1 R2 per sample)
-static uint8_t s_test_tone_buffer[TEST_TONE_PERIOD * 6];
+// Pre-computed 1.5kHz tone buffer (32 samples as float, before noise addition)
+static float s_test_tone_samples[TEST_TONE_PERIOD];
 static bool s_test_tone_initialized = false;
+
+// Fast xorshift32 PRNG for white noise generation
+static uint32_t s_noise_state = 0x12345678;
+
+static inline uint32_t xorshift32(void) {
+    uint32_t x = s_noise_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s_noise_state = x;
+    return x;
+}
+
+// Generate white noise sample in range [-1, 1]
+static inline float white_noise(void) {
+    // Convert to float in range [-1, 1]
+    return ((float)(int32_t)xorshift32()) / 2147483648.0f;
+}
 
 static void init_test_tone_buffer(void) {
     if (s_test_tone_initialized) return;
 
-    const float amplitude = TEST_TONE_AMPLITUDE * 8388607.0f;  // Scale to 24-bit max
-
+    // Pre-compute normalized tone samples [-1, 1]
     for (int i = 0; i < TEST_TONE_PERIOD; i++) {
-        // Generate sine wave sample
         float phase = (2.0f * M_PI * i) / TEST_TONE_PERIOD;
-        float sample = sinf(phase) * amplitude;
-        int32_t sample_int = (int32_t)sample;
-
-        // Pack as 24-bit LE (same value for L and R)
-        int offset = i * 6;
-        // Left channel
-        s_test_tone_buffer[offset + 0] = (sample_int >>  0) & 0xFF;
-        s_test_tone_buffer[offset + 1] = (sample_int >>  8) & 0xFF;
-        s_test_tone_buffer[offset + 2] = (sample_int >> 16) & 0xFF;
-        // Right channel (same as left)
-        s_test_tone_buffer[offset + 3] = (sample_int >>  0) & 0xFF;
-        s_test_tone_buffer[offset + 4] = (sample_int >>  8) & 0xFF;
-        s_test_tone_buffer[offset + 5] = (sample_int >> 16) & 0xFF;
+        s_test_tone_samples[i] = sinf(phase);
     }
 
+    // Seed noise generator with esp_random for better randomness
+    s_noise_state = esp_random();
+
     s_test_tone_initialized = true;
-    ESP_LOGI(TAG, "Test tone buffer initialized: %d Hz, %d samples/cycle, %.0f dB",
-             TEST_TONE_FREQ_HZ, TEST_TONE_PERIOD, TEST_TONE_DB);
+    ESP_LOGI(TAG, "Test tone initialized: %d Hz, tone=%.0fdB, noise=%.0fdB, SNR=%.0fdB",
+             TEST_TONE_FREQ_HZ, TEST_TONE_DB, TEST_NOISE_DB, TEST_TONE_DB - TEST_NOISE_DB);
 }
 
-// Fill buffer with test tone samples (wraps around circular buffer)
+// Fill buffer with test tone + white noise samples
 static void fill_test_tone_samples(uint8_t* out, int num_stereo_samples, int* phase_idx) {
+    const float tone_scale = TEST_TONE_AMPLITUDE * 8388607.0f;
+    const float noise_scale = TEST_NOISE_AMPLITUDE * 8388607.0f;
+
     for (int i = 0; i < num_stereo_samples; i++) {
-        int src_offset = (*phase_idx % TEST_TONE_PERIOD) * 6;
+        // Get tone sample from circular buffer
+        float tone = s_test_tone_samples[*phase_idx % TEST_TONE_PERIOD] * tone_scale;
+        // Add white noise
+        float noise = white_noise() * noise_scale;
+        float sample = tone + noise;
+
+        // Clamp to 24-bit range
+        if (sample > 8388607.0f) sample = 8388607.0f;
+        if (sample < -8388608.0f) sample = -8388608.0f;
+        int32_t sample_int = (int32_t)sample;
+
+        // Pack as 24-bit LE stereo (same value for L and R)
         int dst_offset = i * 6;
-        memcpy(&out[dst_offset], &s_test_tone_buffer[src_offset], 6);
+        out[dst_offset + 0] = (sample_int >>  0) & 0xFF;
+        out[dst_offset + 1] = (sample_int >>  8) & 0xFF;
+        out[dst_offset + 2] = (sample_int >> 16) & 0xFF;
+        out[dst_offset + 3] = (sample_int >>  0) & 0xFF;
+        out[dst_offset + 4] = (sample_int >>  8) & 0xFF;
+        out[dst_offset + 5] = (sample_int >> 16) & 0xFF;
+
         (*phase_idx)++;
     }
 }
