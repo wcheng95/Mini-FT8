@@ -1,4 +1,6 @@
-I have got ft8 decoder working on a .wav file and encoder working to print 79 tones. UI is nice and The major task is to enable USB Host.
+# First milestone (2025/12/24)
+With help from Zhenxing, N6HAN, we have our first on air ft8 message decoded on M5 Cardputer
+![First on air FT8 decoded message](IMG_5208.png)
 
 # MiniFT8 (ESP32-S3 / M5 Cardputer)
 
