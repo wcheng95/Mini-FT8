@@ -33,7 +33,8 @@ static const char* TAG = "UAC_STREAM";
 // Test tone parameters
 #define TEST_TONE_FREQ_HZ   1500    // 1.5 kHz test tone
 #define TEST_TONE_PERIOD    32      // 48000 / 1500 = 32 samples per cycle
-#define TEST_TONE_AMPLITUDE 0.5f    // Amplitude in range [0, 1]
+#define TEST_TONE_DB        (-50.0f)  // Amplitude in dB (0 dB = full scale)
+#define TEST_TONE_AMPLITUDE (powf(10.0f, TEST_TONE_DB / 20.0f))  // -50dB ≈ 0.00316
 
 // Pre-computed 1.5kHz tone buffer (32 samples, 24-bit stereo = 192 bytes)
 // Format: 24-bit LE stereo (L0 L1 L2 R0 R1 R2 per sample)
@@ -64,8 +65,8 @@ static void init_test_tone_buffer(void) {
     }
 
     s_test_tone_initialized = true;
-    ESP_LOGI(TAG, "Test tone buffer initialized: %d Hz, %d samples/cycle",
-             TEST_TONE_FREQ_HZ, TEST_TONE_PERIOD);
+    ESP_LOGI(TAG, "Test tone buffer initialized: %d Hz, %d samples/cycle, %.0f dB",
+             TEST_TONE_FREQ_HZ, TEST_TONE_PERIOD, TEST_TONE_DB);
 }
 
 // Fill buffer with test tone samples (wraps around circular buffer)
@@ -754,7 +755,7 @@ bool uac_start(void) {
 
     s_state = UAC_STATE_STREAMING;
     g_streaming = true;
-    snprintf(s_status_string, sizeof(s_status_string), "Test Tone 1.5kHz");
+    snprintf(s_status_string, sizeof(s_status_string), "Test 1.5kHz %.0fdB", TEST_TONE_DB);
     return true;
 
 #else
