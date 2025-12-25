@@ -36,6 +36,9 @@ extern "C" {
 #include <ctime>
 #include "esp_timer.h"
 #include "stream_uac.h"
+#define ENABLE_BLE 0
+
+#if ENABLE_BLE
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -45,6 +48,7 @@ extern "C" {
 #include "nvs_flash.h"
 #include "soc/soc_caps.h"
 #include "esp_bt.h"
+#endif
 #ifndef FT8_SAMPLE_RATE
 #define FT8_SAMPLE_RATE 12000
 #endif
@@ -53,13 +57,17 @@ extern "C" {
 #define UART_RX_UUID    0xFFE1
 #define UART_TX_UUID    0xFFE2
 
+#if ENABLE_BLE
 static const ble_uuid16_t uart_svc_uuid =
     BLE_UUID16_INIT(UART_SVC_UUID);
 static const ble_uuid16_t uart_rx_uuid =
     BLE_UUID16_INIT(UART_RX_UUID);
 static const ble_uuid16_t uart_tx_uuid =
     BLE_UUID16_INIT(UART_TX_UUID);
+#endif
 
+
+#if ENABLE_BLE
 
 static QueueHandle_t ble_rx_queue = nullptr;
 static uint16_t gatt_tx_handle = 0;
@@ -208,6 +216,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 // BLE UART-style service (Nordic-like) UUIDs
 [[maybe_unused]] static uint8_t ble_rx_placeholder = 0;
 [[maybe_unused]] static uint8_t ble_tx_placeholder = 0;
+#endif // ENABLE_BLE
 
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, DEBUG, LIST, STATUS };
@@ -332,7 +341,9 @@ int64_t rtc_now_ms();
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+#if ENABLE_BLE
 static uint8_t g_own_addr_type;
+#endif
 
 static void ensure_usb() {
   if (usb_ready) return;
@@ -921,6 +932,8 @@ static void debug_log_line(const std::string& msg) {
   }
 }
 
+#if ENABLE_BLE
+
 static void host_send_bt(const std::string& s)
 {
     if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
@@ -987,6 +1000,12 @@ static void ble_app_advertise(void)
         ESP_LOGI(BT_TAG, "Advertising as Mini-FT8");
     }
 }
+
+#else  // ENABLE_BLE
+static void host_send_bt(const std::string& s) { (void)s; }
+static void init_bluetooth(void) {}
+static void poll_ble_uart() {}
+#endif // ENABLE_BLE
 
 static std::string trim_copy(const std::string& s) {
   size_t b = 0, e = s.size();
@@ -1145,7 +1164,7 @@ static void host_handle_line(const std::string& line_in) {
 }
 
 static void host_process_bytes(const uint8_t* buf, size_t len) {
-  ESP_LOGI(BT_TAG, "host_process_bytes len=%u", (unsigned)len);
+  ESP_LOGI(TAG, "host_process_bytes len=%u", (unsigned)len);
   for (size_t i = 0; i < len; ) {
     if (host_bin_active) {
       // Skip any stray CR/LF before first payload byte
@@ -1258,7 +1277,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
     char ch = (char)buf[i++];
     if (ch == '\r' || ch == '\n') {
       if (!host_input.empty()) {
-        ESP_LOGI(BT_TAG, "HOST line: %s", host_input.c_str());
+    ESP_LOGI(TAG, "HOST line: %s", host_input.c_str());
         host_handle_line(host_input);
         host_input.clear();
       } else {
@@ -1283,6 +1302,7 @@ static void poll_host_uart() {
   }
 }
 
+#if ENABLE_BLE
 static void poll_ble_uart() {
   if (!ble_rx_queue) return;
   uint8_t buf[256];
@@ -1311,6 +1331,7 @@ static void poll_ble_uart() {
   }
 }
 
+#endif // ENABLE_BLE
 
 static void load_station_data() {
   FILE* f = fopen(STATION_FILE, "r");

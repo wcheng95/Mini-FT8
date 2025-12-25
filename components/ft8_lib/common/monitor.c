@@ -79,12 +79,48 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     me->fft_norm = 2.0f / me->nfft;
     // const int len_window = 1.8f * me->block_size; // hand-picked and optimized
 
-    // Allocate window and analysis frame dynamically
+    // Allocate enough blocks to fit the entire FT8/FT4 slot in memory
+    const int max_blocks = (int)(slot_time / symbol_period);
+    // Keep only FFT bins in the specified frequency range (f_min/f_max)
+    me->min_bin = (int)(cfg->f_min * symbol_period);
+    me->max_bin = (int)(cfg->f_max * symbol_period) + 1;
+    const int num_bins = me->max_bin - me->min_bin;
+
+    LOG(LOG_INFO, "Block size = %d\n", me->block_size);
+    LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
+
+    // Allocate FFT work buffer first (largest transient block)
+    size_t fft_needed = 0;
+    kiss_fftr_alloc(me->nfft, 0, NULL, &fft_needed);
+    fft_work_buf = (uint8_t*)malloc(fft_needed);
+    if (fft_work_buf == NULL || fft_plan_init_with_buffer(&me->fft_plan, me->nfft, fft_work_buf, fft_needed) != 0)
+    {
+        LOG(LOG_ERROR, "FFT plan init failed\n");
+        return;
+    }
+
+    // Allocate waterfall next
+    int block_stride = cfg->time_osr * cfg->freq_osr * num_bins;
+    size_t wf_bytes = (size_t)max_blocks * block_stride * sizeof(WF_ELEM_T);
+    waterfall_mag_buf = (WF_ELEM_T*)malloc(wf_bytes);
+    if (waterfall_mag_buf == NULL)
+    {
+        LOG(LOG_ERROR, "Waterfall alloc failed (%zu bytes)\n", wf_bytes);
+        monitor_free(me);
+        return;
+    }
+
+    waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
+    me->wf.mag = waterfall_mag_buf;
+    me->wf.protocol = cfg->protocol;
+
+    // Allocate window and analysis frame last
     window_buf = (float*)malloc(sizeof(float) * me->nfft);
     last_frame_buf = (float*)calloc(me->nfft, sizeof(float));
     if (window_buf == NULL || last_frame_buf == NULL)
     {
         LOG(LOG_ERROR, "Monitor alloc failed (window/frame)\n");
+        monitor_free(me);
         return;
     }
 
@@ -94,18 +130,6 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
         me->window[i] = me->fft_norm * hann_i(i, me->nfft);
     }
     me->last_frame = last_frame_buf;
-
-    LOG(LOG_INFO, "Block size = %d\n", me->block_size);
-    LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
-
-    // Allocate FFT work buffer dynamically based on kiss_fftr requirement
-    size_t fft_needed = 0;
-    kiss_fftr_alloc(me->nfft, 0, NULL, &fft_needed);
-    fft_work_buf = (uint8_t*)malloc(fft_needed);
-    if (fft_work_buf == NULL || fft_plan_init_with_buffer(&me->fft_plan, me->nfft, fft_work_buf, fft_needed) != 0)
-    {
-        LOG(LOG_ERROR, "FFT plan init failed\n");
-    }
 
     LOG(LOG_INFO, "N_FFT = %d\n", me->nfft);
 
@@ -120,27 +144,6 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     LOG(LOG_INFO, "N_iFFT = %d\n", me->nifft);
     LOG(LOG_DEBUG, "iFFT work area = %zu\n", ifft_work_size);
 #endif
-
-    // Allocate enough blocks to fit the entire FT8/FT4 slot in memory
-    const int max_blocks = (int)(slot_time / symbol_period);
-    // Keep only FFT bins in the specified frequency range (f_min/f_max)
-    me->min_bin = (int)(cfg->f_min * symbol_period);
-    me->max_bin = (int)(cfg->f_max * symbol_period) + 1;
-    const int num_bins = me->max_bin - me->min_bin;
-
-    // Allocate waterfall dynamically to reduce .bss usage
-    int block_stride = cfg->time_osr * cfg->freq_osr * num_bins;
-    size_t wf_bytes = (size_t)max_blocks * block_stride * sizeof(WF_ELEM_T);
-    waterfall_mag_buf = (WF_ELEM_T*)malloc(wf_bytes);
-    if (waterfall_mag_buf == NULL)
-    {
-        LOG(LOG_ERROR, "Waterfall alloc failed (%zu bytes)\n", wf_bytes);
-        return;
-    }
-
-    waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
-    me->wf.mag = waterfall_mag_buf;
-    me->wf.protocol = cfg->protocol;
 
     me->symbol_period = symbol_period;
 

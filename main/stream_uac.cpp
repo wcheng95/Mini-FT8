@@ -362,7 +362,7 @@ static void stream_uac_task(void* arg) {
         .f_max = 3000.0f,
         .sample_rate = FT8_SAMPLE_RATE,
         .time_osr = 1,
-        .freq_osr = 1,  // keep within RAM budget
+        .freq_osr = 2,  // finer bins; relies on freed BLE RAM
         .protocol = FTX_PROTOCOL_FT8
     };
 
