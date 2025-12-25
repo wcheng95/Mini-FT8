@@ -32,8 +32,8 @@ static const char* TAG = "UAC_STREAM";
 
 #if USE_TEST_TONE
 // Test tone parameters
-#define TEST_TONE_FREQ_HZ   1500    // 1.5 kHz test tone
-#define TEST_TONE_PERIOD    32      // 48000 / 1500 = 32 samples per cycle
+#define TEST_TONE_FREQ_HZ   1000    // 1 kHz test tone
+#define TEST_TONE_PERIOD    48      // 48000 / 1000 = 48 samples per cycle
 #define TEST_TONE_DB        (-50.0f)  // Tone amplitude in dB (0 dB = full scale)
 #define TEST_NOISE_DB       (-80.0f)  // White noise floor in dB
 #define TEST_TONE_AMPLITUDE (powf(10.0f, TEST_TONE_DB / 20.0f))  // -50dB ≈ 0.00316
