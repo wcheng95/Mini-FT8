@@ -23,6 +23,62 @@ extern "C" {
 
 static const char* TAG = "UAC_STREAM";
 
+// ============================================================================
+// TEST TONE MODE: Replace UAC streaming with synthetic 1.5kHz tone for debugging
+// Set to 1 to enable test tone, 0 for normal UAC streaming
+// ============================================================================
+#define USE_TEST_TONE 1
+
+#if USE_TEST_TONE
+// Test tone parameters
+#define TEST_TONE_FREQ_HZ   1500    // 1.5 kHz test tone
+#define TEST_TONE_PERIOD    32      // 48000 / 1500 = 32 samples per cycle
+#define TEST_TONE_AMPLITUDE 0.5f    // Amplitude in range [0, 1]
+
+// Pre-computed 1.5kHz tone buffer (32 samples, 24-bit stereo = 192 bytes)
+// Format: 24-bit LE stereo (L0 L1 L2 R0 R1 R2 per sample)
+static uint8_t s_test_tone_buffer[TEST_TONE_PERIOD * 6];
+static bool s_test_tone_initialized = false;
+
+static void init_test_tone_buffer(void) {
+    if (s_test_tone_initialized) return;
+
+    const float amplitude = TEST_TONE_AMPLITUDE * 8388607.0f;  // Scale to 24-bit max
+
+    for (int i = 0; i < TEST_TONE_PERIOD; i++) {
+        // Generate sine wave sample
+        float phase = (2.0f * M_PI * i) / TEST_TONE_PERIOD;
+        float sample = sinf(phase) * amplitude;
+        int32_t sample_int = (int32_t)sample;
+
+        // Pack as 24-bit LE (same value for L and R)
+        int offset = i * 6;
+        // Left channel
+        s_test_tone_buffer[offset + 0] = (sample_int >>  0) & 0xFF;
+        s_test_tone_buffer[offset + 1] = (sample_int >>  8) & 0xFF;
+        s_test_tone_buffer[offset + 2] = (sample_int >> 16) & 0xFF;
+        // Right channel (same as left)
+        s_test_tone_buffer[offset + 3] = (sample_int >>  0) & 0xFF;
+        s_test_tone_buffer[offset + 4] = (sample_int >>  8) & 0xFF;
+        s_test_tone_buffer[offset + 5] = (sample_int >> 16) & 0xFF;
+    }
+
+    s_test_tone_initialized = true;
+    ESP_LOGI(TAG, "Test tone buffer initialized: %d Hz, %d samples/cycle",
+             TEST_TONE_FREQ_HZ, TEST_TONE_PERIOD);
+}
+
+// Fill buffer with test tone samples (wraps around circular buffer)
+static void fill_test_tone_samples(uint8_t* out, int num_stereo_samples, int* phase_idx) {
+    for (int i = 0; i < num_stereo_samples; i++) {
+        int src_offset = (*phase_idx % TEST_TONE_PERIOD) * 6;
+        int dst_offset = i * 6;
+        memcpy(&out[dst_offset], &s_test_tone_buffer[src_offset], 6);
+        (*phase_idx)++;
+    }
+}
+#endif // USE_TEST_TONE
+
 // External references from main.cpp
 extern bool g_streaming;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
@@ -503,13 +559,174 @@ static void stream_uac_task(void* arg) {
     vTaskDelete(NULL);
 }
 
+#if USE_TEST_TONE
+// Test tone streaming task - injects synthetic 1.5kHz tone for debugging
+// This bypasses USB/UAC completely and uses precise timing
+static void stream_test_tone_task(void* arg) {
+    ESP_LOGI(TAG, "*** TEST TONE MODE *** - Injecting synthetic 1.5kHz tone");
+
+    // Initialize test tone buffer
+    init_test_tone_buffer();
+
+    // Initialize resampler
+    resample_init(&s_resample_state);
+    log_heap_stats("test_tone_start");
+
+    // Initialize FT8 monitor (waterfall/decoder)
+    monitor_config_t mon_cfg = {
+        .f_min = 200.0f,
+        .f_max = 3000.0f,
+        .sample_rate = FT8_SAMPLE_RATE,
+        .time_osr = 1,
+        .freq_osr = 2,
+        .protocol = FTX_PROTOCOL_FT8
+    };
+
+    monitor_t mon;
+    monitor_init(&mon, &mon_cfg);
+    monitor_reset(&mon);
+    log_heap_stats("after_monitor_init");
+
+    const int target_blocks = 81;
+    const int block_samples = mon.block_size;  // 1920 @ 12kHz = 160ms
+
+    // Allocate buffers
+    // Every 1ms we inject 48 stereo samples = 288 bytes
+    const int samples_per_ms = 48;
+    const int bytes_per_injection = samples_per_ms * 6;  // 288 bytes
+
+    uint8_t* tone_buffer = (uint8_t*)heap_caps_malloc(bytes_per_injection, MALLOC_CAP_DEFAULT);
+    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * block_samples, MALLOC_CAP_DEFAULT);
+    float* temp_12k = (float*)heap_caps_malloc(sizeof(float) * 256, MALLOC_CAP_DEFAULT);
+    log_heap_stats("test_tone_buffers_allocated");
+
+    if (!tone_buffer || !ft8_buffer || !temp_12k) {
+        ESP_LOGE(TAG, "Buffer allocation failed");
+        if (tone_buffer) free(tone_buffer);
+        if (ft8_buffer) free(ft8_buffer);
+        if (temp_12k) free(temp_12k);
+        monitor_free(&mon);
+        s_stream_task_handle = NULL;
+        g_streaming = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int ft8_buffer_idx = 0;
+    int tone_phase_idx = 0;  // Track position in tone cycle
+    TickType_t next_wake = xTaskGetTickCount();
+    int slot_blocks = 0;
+    int64_t slot_start_ms = 0;
+
+    // Align start to the current 15-second boundary using RTC
+    {
+        int64_t now_ms = rtc_now_ms();
+        int64_t rem = now_ms % 15000;
+        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+        ESP_LOGI(TAG, "Test tone aligning to slot: now=%lldms rem=%lldms wait=%lldms",
+                 (long long)now_ms, (long long)rem, (long long)wait_ms);
+        if (wait_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+            now_ms = rtc_now_ms();
+        }
+        slot_start_ms = now_ms - (now_ms % 15000);
+    }
+
+    ESP_LOGI(TAG, "Test tone streaming started: %d samples/ms, %d bytes/injection",
+             samples_per_ms, bytes_per_injection);
+
+    while (!s_stop_requested) {
+        // Fill buffer with test tone samples (48 samples @ 48kHz = 1ms of audio)
+        fill_test_tone_samples(tone_buffer, samples_per_ms, &tone_phase_idx);
+
+        // Convert and resample: 24-bit/48kHz/stereo -> 12kHz mono float
+        int samples_12k = uac_to_ft8_samples(&s_resample_state, tone_buffer,
+                                              temp_12k, samples_per_ms);
+
+        // Accumulate into ft8_buffer
+        for (int i = 0; i < samples_12k && !s_stop_requested; i++) {
+            ft8_buffer[ft8_buffer_idx++] = temp_12k[i];
+
+            // When we have a full block (1920 samples = 160ms)
+            if (ft8_buffer_idx >= block_samples) {
+                // Apply gain normalization (same as UAC task)
+                double acc = 0.0;
+                for (int j = 0; j < block_samples; ++j) {
+                    acc += fabsf(ft8_buffer[j]);
+                }
+                float level = (float)(acc / block_samples);
+                float gain = (level > 1e-6f) ? 0.5f / level : 1.0f;
+                if (gain < 0.1f) gain = 0.1f;
+                if (gain > 30.0f) gain = 30.0f;
+                for (int j = 0; j < block_samples; ++j) {
+                    ft8_buffer[j] *= gain;
+                }
+
+                static int rms_log_count = 0;
+                if ((rms_log_count++ % 30) == 0) {
+                    ESP_LOGI(TAG, "TestTone Block avg=%.5f gain=%.2f post=%.3f phase=%d",
+                             level, gain, level * gain, tone_phase_idx % TEST_TONE_PERIOD);
+                }
+
+                if (mon.wf.num_blocks < target_blocks) {
+                    monitor_process(&mon, ft8_buffer);
+                    push_waterfall_latest(mon);
+                }
+
+                ft8_buffer_idx = 0;
+
+                // Track slot progression and decode at 79 blocks
+                slot_blocks++;
+                int64_t now_ms = rtc_now_ms();
+                if (slot_blocks >= 79) {
+                    ESP_LOGI(TAG, "TestTone triggering decode slot=%lld blocks=%d",
+                             (long long)(slot_start_ms / 15000), slot_blocks);
+                    decode_monitor_results(&mon, &mon_cfg, false);
+                    monitor_reset(&mon);
+                    mon.wf.num_blocks = 0;
+                    slot_blocks = 0;
+                    slot_start_ms = now_ms - (now_ms % 15000);
+                    next_wake = xTaskGetTickCount();
+                } else if (now_ms - slot_start_ms >= 15000) {
+                    ESP_LOGW(TAG, "TestTone slot rollover at %lldms, resetting",
+                             (long long)(now_ms - slot_start_ms));
+                    monitor_reset(&mon);
+                    mon.wf.num_blocks = 0;
+                    slot_blocks = 0;
+                    slot_start_ms = now_ms - (now_ms % 15000);
+                    next_wake = xTaskGetTickCount();
+                }
+            }
+        }
+
+        // Wait 1ms before next injection
+        vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(1));
+    }
+
+    // Cleanup
+    free(tone_buffer);
+    free(ft8_buffer);
+    free(temp_12k);
+    monitor_free(&mon);
+
+    g_streaming = false;
+    s_stream_task_handle = NULL;
+    ESP_LOGI(TAG, "Test tone streaming task stopped");
+    vTaskDelete(NULL);
+}
+#endif // USE_TEST_TONE
+
 // Public API implementation
 uac_stream_state_t uac_get_state(void) {
     return s_state;
 }
 
 bool uac_is_streaming(void) {
+#if USE_TEST_TONE
+    return s_state == UAC_STATE_STREAMING && s_stream_task_handle != NULL;
+#else
     return s_state == UAC_STATE_STREAMING && s_mic_handle != NULL;
+#endif
 }
 
 bool uac_start(void) {
@@ -518,9 +735,31 @@ bool uac_start(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Starting UAC host");
     s_stop_requested = false;
     resample_init(&s_resample_state);
+
+#if USE_TEST_TONE
+    // TEST TONE MODE: Skip USB/UAC initialization, start test tone task directly
+    ESP_LOGI(TAG, "*** TEST TONE MODE ENABLED *** - Starting synthetic tone injection");
+
+    // Start the test tone task directly
+    BaseType_t ret = xTaskCreatePinnedToCore(stream_test_tone_task, "test_tone",
+                                              STREAM_TASK_STACK_SIZE, NULL,
+                                              UAC_STREAM_TASK_PRIORITY,
+                                              &s_stream_task_handle, 1);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create test tone task");
+        return false;
+    }
+
+    s_state = UAC_STATE_STREAMING;
+    g_streaming = true;
+    snprintf(s_status_string, sizeof(s_status_string), "Test Tone 1.5kHz");
+    return true;
+
+#else
+    // Normal UAC mode
+    ESP_LOGI(TAG, "Starting UAC host");
 
     // Create event queue
     s_event_queue = xQueueCreate(10, sizeof(uac_event_t));
@@ -559,6 +798,7 @@ bool uac_start(void) {
     s_state = UAC_STATE_WAITING;
     snprintf(s_status_string, sizeof(s_status_string), "Waiting for device");
     return true;
+#endif
 }
 
 void uac_stop(void) {
@@ -566,9 +806,24 @@ void uac_stop(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "Stopping UAC host");
     s_stop_requested = true;
     g_streaming = false;
+
+#if USE_TEST_TONE
+    ESP_LOGI(TAG, "Stopping test tone");
+
+    // Wait for test tone task to finish
+    int timeout = 50;  // 5 seconds
+    while (s_stream_task_handle && timeout > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout--;
+    }
+
+    s_state = UAC_STATE_IDLE;
+    snprintf(s_status_string, sizeof(s_status_string), "Idle");
+    ESP_LOGI(TAG, "Test tone stopped");
+#else
+    ESP_LOGI(TAG, "Stopping UAC host");
 
     // Send stop event
     if (s_event_queue) {
@@ -591,6 +846,7 @@ void uac_stop(void) {
     s_state = UAC_STATE_IDLE;
     snprintf(s_status_string, sizeof(s_status_string), "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
+#endif
 }
 
 const char* uac_get_status_string(void) {
