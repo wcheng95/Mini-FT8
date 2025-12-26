@@ -36,6 +36,7 @@ extern "C" {
 #include <cstdlib>
 #include <ctime>
 #include "esp_timer.h"
+#include "esp_sleep.h"
 #include "stream_uac.h"
 #define ENABLE_BLE 0
 
@@ -321,7 +322,6 @@ static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::NONE;
 static std::string g_ant = "EFHW";
 static std::string g_comment1 = "MiniFT8 /Radio /Ant";
-static std::string g_comment2;
 static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
@@ -914,9 +914,9 @@ static void draw_menu_view() {
   lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 8 ? menu_edit_buf : g_ant));
-  // Combine comments into one line; Comment2 hidden (placeholder NA)
+  // Combine comments into one line
   lines.push_back(std::string("C:") + head_trim(menu_edit_idx == 9 ? menu_edit_buf : expand_comment1(), 16));
-  lines.push_back("");
+  lines.push_back(std::string("Sleep:") + (M5.Power.isCharging() ? "press" : "USB?"));
   lines.push_back(battery_status_line());
 
   int highlight_abs = -1;
@@ -1421,8 +1421,6 @@ static void load_station_data() {
       g_ant = trim_copy(line + 4);
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
-    } else if (strncmp(line, "comment2=", 9) == 0) {
-      g_comment2 = trim_copy(line + 9);
     }
   }
   fclose(f);
@@ -1453,7 +1451,6 @@ static void save_station_data() {
   fprintf(f, "radio=%d\n", (int)g_radio);
   fprintf(f, "ant=%s\n", g_ant.c_str());
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
-  fprintf(f, "comment2=%s\n", g_comment2.c_str());
   fclose(f);
 }
 
@@ -1905,7 +1902,6 @@ static void app_task_core0(void* /*param*/) {
                 } else {
                   if (idx == 2) g_ant = menu_edit_buf;
                   else if (idx == 3) g_comment1 = menu_edit_buf;
-                  else if (idx == 4) g_comment2 = menu_edit_buf;
                 }
                 save_station_data();
                 menu_edit_idx = -1;
@@ -1983,6 +1979,16 @@ static void app_task_core0(void* /*param*/) {
                   menu_long_buf = g_comment1;
                   menu_long_backup = g_comment1;
                   draw_menu_view();
+                } else if (c == '5') {
+                  if (M5.Power.isCharging()) {
+                    ESP_LOGI(TAG, "Sleep button pressed while charging; entering deep sleep");
+                    M5.Display.sleep();
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_deep_sleep_start();
+                  } else {
+                    debug_log_line("Sleep skipped: not charging");
+                    draw_menu_view();
+                  }
                 }
               }
           }
