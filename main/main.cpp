@@ -26,6 +26,7 @@ extern "C" {
 #include <cstdint>
 #include <vector>
 #include <cstring>
+#include <unordered_map>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "driver/usb_serial_jtag.h"
@@ -705,10 +706,31 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   int num_candidates = ftx_find_candidates(&mon->wf, max_cand, candidates, 5);
   ESP_LOGI(TAG, "Candidates found: %d", num_candidates);
 
+  // Estimate noise floor in dB from the waterfall (mean of all bins in slot)
+  float noise_db = -120.0f;
+  if (mon->wf.mag && mon->wf.num_blocks > 0) {
+    const size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
+    uint32_t hist[256] = {0};
+    for (size_t i = 0; i < total; ++i) {
+      hist[mon->wf.mag[i]]++;
+    }
+    uint64_t target = total / 4;  // 25th percentile to avoid signal bias
+    uint64_t accum = 0;
+    int noise_scaled = 0;
+    for (int v = 0; v < 256; ++v) {
+      accum += hist[v];
+      if (accum >= target) {
+        noise_scaled = v;
+        break;
+      }
+    }
+    noise_db = 0.5f * ((float)noise_scaled - 240.0f);  // scaled back to dB
+  }
+
   std::vector<UiRxLine> ui_lines;
   if (num_candidates > 0) {
     int decodedCount = 0;
-    std::vector<std::string> seen;
+    std::unordered_map<std::string, int> seen_idx; // text -> index in ui_lines
     for (int i = 0; i < num_candidates; ++i) {
       ftx_message_t message;
       ftx_decode_status_t status;
@@ -736,21 +758,45 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
                          candidates[i].freq_sub / (float)cfg->freq_osr) / mon->symbol_period;
         float time_s = (candidates[i].time_offset +
                         candidates[i].time_sub / (float)cfg->time_osr) * mon->symbol_period;
-        ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr(est)=%d : %s",
-                 decodedCount, time_s, freq_hz, candidates[i].score, text);
-        // Deduplicate exact text
-        if (std::find(seen.begin(), seen.end(), std::string(text)) != seen.end()) {
+        // Approximate candidate power from waterfall bin
+        float cand_db = noise_db;
+        {
+          int t_index = candidates[i].time_offset * mon->wf.time_osr + candidates[i].time_sub;
+          int f_index = candidates[i].freq_offset * mon->wf.freq_osr + candidates[i].freq_sub;
+          size_t offset = (size_t)t_index * (size_t)mon->wf.block_stride + (size_t)f_index;
+          size_t total = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
+          if (mon->wf.mag && offset < total) {
+            int scaled = mon->wf.mag[offset];
+            cand_db = 0.5f * ((float)scaled - 240.0f);
+          }
+        }
+        float snr_db = cand_db - noise_db;
+        // Quantize to even integers and clamp to WSJT-like range [-30, 32]
+        int snr_q = (int)lrintf(snr_db / 2.0f) * 2;
+        if (snr_q < -30) snr_q = -30;
+        if (snr_q > 32) snr_q = 32;
+
+        ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
+                 decodedCount, time_s, freq_hz, snr_q, text);
+        // Deduplicate exact text but keep the highest SNR
+        std::string text_str(text);
+        auto it = seen_idx.find(text_str);
+        if (it != seen_idx.end()) {
+          int idx = it->second;
+          if (snr_q > ui_lines[idx].snr) {
+            ui_lines[idx].snr = snr_q;
+          }
           continue;
         }
-        seen.push_back(std::string(text));
 
         UiRxLine line;
         line.text = text;
-        line.snr = candidates[i].score;
+        line.snr = snr_q;
         if (line.text.rfind("CQ ", 0) == 0 || line.text == "CQ") {
           line.is_cq = true;
         }
         ui_lines.push_back(line);
+        seen_idx[text_str] = (int)ui_lines.size() - 1;
         decodedCount++;
         if (decodedCount >= 32) break; // safety cap
       }
