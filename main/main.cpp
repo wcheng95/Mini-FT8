@@ -244,6 +244,7 @@ static BeaconMode g_beacon = BeaconMode::OFF;
 static int g_offset_hz = 1500;
 static int g_band_sel = 1; // default 80m
 static bool g_tune = false;
+static bool g_cat_toggle_high = false;
 static std::string g_date = "2025-12-11";
 static std::string g_time = "10:10:00";
 static int status_edit_idx = -1;     // 0-5
@@ -1785,7 +1786,18 @@ static void app_task_core0(void* /*param*/) {
               if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
               else if (c == '2') { status_edit_idx = 1; status_edit_buffer.clear(); draw_status_view(); }
               else if (c == '3') { g_band_sel = (g_band_sel + 1) % g_bands.size(); save_station_data(); draw_status_view(); }
-              else if (c == '4') { g_tune = !g_tune; draw_status_view(); }
+              else if (c == '4') {
+                g_tune = !g_tune;
+                const char* cmd = g_cat_toggle_high ? "FA00007074000;" : "FA00014074000;";
+                g_cat_toggle_high = !g_cat_toggle_high;
+                if (cat_cdc_ready()) {
+                  esp_err_t rc = cat_cdc_send(reinterpret_cast<const uint8_t*>(cmd), strlen(cmd), 200);
+                  ESP_LOGI(TAG, "CAT send %s rc=%s", cmd, esp_err_to_name(rc));
+                } else {
+                  ESP_LOGW(TAG, "CAT not ready; skipped send %s", cmd);
+                }
+                draw_status_view();
+              }
               else if (c == '5') { status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view(); }
               else if (c == '6') { status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view(); }
             } else {

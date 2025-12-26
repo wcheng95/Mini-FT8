@@ -16,5 +16,7 @@ dependencies:
   #   public: true
   lvgl/lvgl: ^8.3.9
   # USB Host UAC for audio streaming
-  espressif/usb_host_uac: "^1.2.0"
-  espressif/usb: "*"
+  espressif/usb_host_uac: ^1.2.0
+  espressif/usb: '*'
+  # USB Host CDC for CAT
+  espressif/usb_host_cdc_acm: ^2.2.0

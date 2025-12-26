@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,10 @@ const char* uac_get_status_string(void);
 // Returns pointer to static buffer, do not free
 const char* uac_get_debug_line1(void);
 const char* uac_get_debug_line2(void);
+
+// USB CDC-ACM (CAT control) helpers
+bool cat_cdc_ready(void);
+esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

@@ -9,6 +9,8 @@
 #include "esp_err.h"
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
+#include "usb/cdc_acm_host.h"
+#include "usb/usb_types_ch9.h"
 
 extern "C" {
 #include "ft8/decode.h"
@@ -19,6 +21,7 @@ extern "C" {
 #include "ui.h"
 #include <cstring>
 #include <cmath>
+#include <inttypes.h>
 
 static const char* TAG = "UAC_STREAM";
 
@@ -68,11 +71,18 @@ typedef struct {
 static uac_stream_state_t s_state = UAC_STATE_IDLE;
 static QueueHandle_t s_event_queue = NULL;
 static uac_host_device_handle_t s_mic_handle = NULL;
+static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static TaskHandle_t s_usb_task_handle = NULL;
 static TaskHandle_t s_uac_task_handle = NULL;
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
+static bool s_cdc_installed = false;
+static int s_cdc_iface = -1;
+static int s_cdc_iface_hint = -1;
+static int64_t s_cdc_last_attempt_ms = 0;
+static constexpr uint16_t k_qmx_vid = 0x0483;
+static constexpr uint16_t k_qmx_pid = 0xA34C;
 
 // Debug display buffers
 static char s_debug_line1[64] = "";
@@ -85,6 +95,10 @@ static resample_state_t s_resample_state;
 static void usb_lib_task(void* arg);
 static void uac_lib_task(void* arg);
 static void stream_uac_task(void* arg);
+static void cdc_close(void);
+static void cdc_try_open(void);
+static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
+static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
 
 // Push waterfall row (same as stream_wav.cpp)
 static void push_waterfall_latest(const monitor_t& mon) {
@@ -121,12 +135,148 @@ static void push_waterfall_latest(const monitor_t& mon) {
     ui_push_waterfall_row(scaled, width);
 }
 
+// CDC-ACM helpers (CAT TX only)
+static void cdc_close(void) {
+    if (s_cdc_handle) {
+        cdc_acm_host_close(s_cdc_handle);
+        s_cdc_handle = NULL;
+    }
+    s_cdc_iface = -1;
+    s_cdc_last_attempt_ms = 0;
+    s_cdc_iface_hint = -1;
+}
+
+static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx) {
+    (void)user_ctx;
+    if (!event) return;
+    switch (event->type) {
+    case CDC_ACM_HOST_DEVICE_DISCONNECTED:
+        ESP_LOGI(TAG, "CDC device disconnected");
+        cdc_close();
+        break;
+    case CDC_ACM_HOST_ERROR:
+        ESP_LOGW(TAG, "CDC device error: %d", event->data.error);
+        break;
+    default:
+        break;
+    }
+}
+
+static void cdc_try_open(void) {
+    if (!s_cdc_installed) return;
+    if (s_cdc_handle) return;
+
+    // Throttle attempts
+    int64_t now_ms = rtc_now_ms();
+    if (s_cdc_last_attempt_ms != 0 && (now_ms - s_cdc_last_attempt_ms) < 1000) return;
+    s_cdc_last_attempt_ms = now_ms;
+
+    cdc_acm_host_device_config_t dev_cfg = {
+        .connection_timeout_ms = 1000,
+        .out_buffer_size = 64,   // small TX buffer; RX disabled
+        .in_buffer_size = 0,
+        .event_cb = cdc_event_cb,
+        .data_cb = NULL,
+        .user_arg = NULL,
+    };
+
+    const int max_iface_scan = 12;
+
+    // Try known QMX CAT (VID/PID, iface 0) first
+    {
+        cdc_acm_dev_hdl_t handle = NULL;
+        esp_err_t err = cdc_acm_host_open(k_qmx_vid, k_qmx_pid, 0, &dev_cfg, &handle);
+        if (err == ESP_OK) {
+            s_cdc_handle = handle;
+            s_cdc_iface = 0;
+            ESP_LOGI(TAG, "CDC-ACM opened (QMX iface 0, VID 0x%04x PID 0x%04x)", k_qmx_vid, k_qmx_pid);
+            cdc_acm_host_desc_print(handle);
+            return;
+        } else if (err != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "CDC open QMX iface 0 failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    // Try hinted CDC interface first (if we saw class 0x02)
+    if (s_cdc_iface_hint >= 0) {
+        cdc_acm_dev_hdl_t handle = NULL;
+        esp_err_t err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
+                                          (uint8_t)s_cdc_iface_hint, &dev_cfg, &handle);
+        if (err == ESP_OK) {
+            s_cdc_handle = handle;
+            s_cdc_iface = s_cdc_iface_hint;
+            ESP_LOGI(TAG, "CDC-ACM opened (hint iface %d)", s_cdc_iface_hint);
+            cdc_acm_host_desc_print(handle);
+            return;
+        } else {
+            ESP_LOGW(TAG, "CDC open hint iface %d failed: %s",
+                     s_cdc_iface_hint, esp_err_to_name(err));
+        }
+    }
+
+    for (int iface = 0; iface < max_iface_scan; ++iface) {
+        cdc_acm_dev_hdl_t handle = NULL;
+        esp_err_t err = cdc_acm_host_open(CDC_HOST_ANY_VID, CDC_HOST_ANY_PID,
+                                          (uint8_t)iface, &dev_cfg, &handle);
+        if (err == ESP_OK) {
+            s_cdc_handle = handle;
+            s_cdc_iface = iface;
+            ESP_LOGI(TAG, "CDC-ACM opened (iface %d)", iface);
+            cdc_acm_host_desc_print(handle);
+            break;
+        } else if (err != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "CDC open iface %d failed: %s", iface, esp_err_to_name(err));
+        }
+    }
+
+    if (!s_cdc_handle) {
+        ESP_LOGD(TAG, "CDC-ACM not found yet (attempt at %" PRId64 " ms)", now_ms);
+    }
+}
+
+static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
+    usb_device_info_t info = {};
+    if (usb_host_device_info(usb_dev, &info) == ESP_OK) {
+        ESP_LOGI(TAG, "USB dev addr:%u speed:%d", info.dev_addr, info.speed);
+    }
+
+    const usb_device_desc_t* dev_desc = nullptr;
+    if (usb_host_get_device_descriptor(usb_dev, &dev_desc) == ESP_OK && dev_desc) {
+        ESP_LOGI(TAG, "USB dev attached: VID:0x%04x PID:0x%04x cfgs:%u",
+                 dev_desc->idVendor, dev_desc->idProduct, dev_desc->bNumConfigurations);
+    }
+
+    const usb_config_desc_t* cfg = nullptr;
+    if (usb_host_get_active_config_descriptor(usb_dev, &cfg) == ESP_OK && cfg) {
+        const uint8_t* p = (const uint8_t*)cfg;
+        int offset = 0;
+        while (offset + 2 <= cfg->wTotalLength) {
+            uint8_t len = p[offset];
+            uint8_t dtype = p[offset + 1];
+            if (len == 0) break;
+            if (dtype == USB_B_DESCRIPTOR_TYPE_INTERFACE && len >= sizeof(usb_intf_desc_t)) {
+                const usb_intf_desc_t* intf = (const usb_intf_desc_t*)(p + offset);
+                ESP_LOGI(TAG, "  IF num=%u alt=%u eps=%u class=0x%02x subclass=0x%02x proto=0x%02x",
+                         intf->bInterfaceNumber, intf->bAlternateSetting,
+                         intf->bNumEndpoints, intf->bInterfaceClass,
+                         intf->bInterfaceSubClass, intf->bInterfaceProtocol);
+                if (intf->bInterfaceClass == USB_CLASS_COMM && s_cdc_iface_hint < 0) {
+                    s_cdc_iface_hint = intf->bInterfaceNumber;
+                    ESP_LOGI(TAG, "  -> CDC candidate iface %d", s_cdc_iface_hint);
+                }
+            }
+            offset += len;
+        }
+    }
+}
+
 // UAC device callback
 static void uac_device_callback(uac_host_device_handle_t handle,
                                  const uac_host_device_event_t event,
                                  void* arg) {
     if (event == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
         ESP_LOGI(TAG, "UAC device disconnected");
+        cdc_close();
         if (handle == s_mic_handle) {
             s_mic_handle = NULL;
             s_state = UAC_STATE_WAITING;
@@ -180,6 +330,22 @@ static void usb_lib_task(void* arg) {
     }
 
     ESP_LOGI(TAG, "USB Host installed");
+
+    // Install CDC-ACM driver (for CAT control) before starting class drivers
+    const cdc_acm_host_driver_config_t cdc_cfg = {
+        .driver_task_stack_size = 3072,
+        .driver_task_priority = 4,
+        .xCoreID = 0,
+        .new_dev_cb = cdc_new_dev_cb,
+    };
+    err = cdc_acm_host_install(&cdc_cfg);
+    if (err == ESP_OK) {
+        s_cdc_installed = true;
+        ESP_LOGI(TAG, "CDC-ACM driver installed");
+    } else {
+        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
+    }
+
     xTaskNotifyGive((TaskHandle_t)arg);
 
     while (!s_stop_requested) {
@@ -191,6 +357,13 @@ static void usb_lib_task(void* arg) {
                 usb_host_device_free_all();
             }
         }
+    }
+
+    if (s_cdc_installed) {
+        cdc_close();
+        cdc_acm_host_uninstall();
+        s_cdc_installed = false;
+        ESP_LOGI(TAG, "CDC-ACM driver uninstalled");
     }
 
     ESP_LOGI(TAG, "USB Host uninstalling");
@@ -287,6 +460,9 @@ static void uac_lib_task(void* arg) {
                     snprintf(s_status_string, sizeof(s_status_string),
                              "Streaming 48k/24/2");
 
+                    // Try to open companion CDC-ACM interface (CAT)
+                    cdc_try_open();
+
                     // Start the audio processing task
                     if (s_stream_task_handle == NULL) {
                         xTaskCreatePinnedToCore(stream_uac_task, "stream_uac",
@@ -369,6 +545,7 @@ static void stream_uac_task(void* arg) {
     int slot_blocks = 0;
     int64_t slot_idx = rtc_now_ms() / 15000;
     int64_t slot_start_ms = slot_idx * 15000;
+    (void)slot_start_ms; // silence unused warning
 
     while (!s_stop_requested && s_mic_handle != NULL) {
         // Read USB audio data
@@ -433,6 +610,11 @@ static void stream_uac_task(void* arg) {
                     push_waterfall_latest(mon);
                 }
 
+                // Retry CDC open periodically until success
+                if (!s_cdc_handle) {
+                    cdc_try_open();
+                }
+
                 ft8_buffer_idx = 0;
 
                 // Maintain 160ms timing
@@ -492,6 +674,10 @@ bool uac_start(void) {
         return false;
     }
 
+    s_cdc_last_attempt_ms = 0;
+    s_cdc_iface = -1;
+    s_cdc_iface_hint = -1;
+
     ESP_LOGI(TAG, "Starting UAC host");
     s_stop_requested = false;
     resample_init(&s_resample_state);
@@ -543,6 +729,7 @@ void uac_stop(void) {
     ESP_LOGI(TAG, "Stopping UAC host");
     s_stop_requested = true;
     g_streaming = false;
+    cdc_close();
 
     // Send stop event
     if (s_event_queue) {
@@ -577,4 +764,15 @@ const char* uac_get_debug_line1(void) {
 
 const char* uac_get_debug_line2(void) {
     return s_debug_line2;
+}
+
+bool cat_cdc_ready(void) {
+    return s_cdc_handle != NULL;
+}
+
+esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms) {
+    if (!s_cdc_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return cdc_acm_host_data_tx_blocking(s_cdc_handle, data, len, timeout_ms);
 }
