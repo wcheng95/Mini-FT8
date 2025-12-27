@@ -159,10 +159,15 @@ void ui_force_redraw_rx() {
     last_page = -1;
 }
 
-static void draw_rx_line(int y, const UiRxLine& l, int line_no, bool selected) {
+static void draw_rx_line(int y, const UiRxLine& l, int line_no, bool selected, bool more_indicator) {
     uint16_t color = TFT_WHITE;
-    if (l.is_to_me) color = rgb565(255, 0, 0);
-    else if (l.is_cq) color = rgb565(0, 220, 0);
+    if (more_indicator) {
+        color = rgb565(0, 255, 255); // cyan to indicate more pages
+    } else if (l.is_to_me) {
+        color = rgb565(255, 0, 0);
+    } else if (l.is_cq) {
+        color = rgb565(0, 220, 0);
+    }
     // Sticky line number in first column
     uint16_t bg = selected ? rgb565(30, 30, 60) : TFT_BLACK;
     M5.Display.fillRect(0, y, SCREEN_W, 16, bg);  // clear text band; gap handled by line_h
@@ -203,7 +208,8 @@ void ui_draw_rx(int flash_index) {
         M5.Display.fillRect(0, y, SCREEN_W, line_h, TFT_BLACK);
         if (idx < (int)rx_lines.size()) {
             bool selected = (idx == flash_index);
-            draw_rx_line(y, rx_lines[idx], i + 1, selected);
+            bool more = (rx_page == 0 && rx_lines.size() > RX_LINES && i == RX_LINES - 1);
+            draw_rx_line(y, rx_lines[idx], i + 1, selected, more);
         }
     }
     M5.Display.endWrite();
