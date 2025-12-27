@@ -24,6 +24,7 @@ extern "C" {
 #include <inttypes.h>
 
 static const char* TAG = "UAC_STREAM";
+extern void log_heap(const char* tag);
 
 // External references from main.cpp
 extern bool g_streaming;
@@ -527,6 +528,7 @@ static void stream_uac_task(void* arg) {
     float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
     // Intermediate buffer for 48kHz mono samples (max: 4096 bytes / 6 = 682 stereo samples)
     float* temp_12k = (float*)heap_caps_malloc(sizeof(float) * 1024, MALLOC_CAP_DEFAULT);
+    log_heap("UAC_AFTER_FFT_ALLOC");
 
     if (!usb_buffer || !ft8_buffer || !temp_12k) {
         ESP_LOGE(TAG, "Buffer allocation failed");

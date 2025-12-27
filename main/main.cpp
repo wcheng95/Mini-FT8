@@ -27,6 +27,7 @@ extern "C" {
 #include <vector>
 #include <cstring>
 #include <unordered_map>
+#include <algorithm>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "driver/usb_serial_jtag.h"
@@ -221,7 +222,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 #endif // ENABLE_BLE
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, HOST, DEBUG, LIST, STATUS };
+enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 static int tx_selected_idx = -1;  // index into tx_queue (not including tx_next)
@@ -277,8 +278,17 @@ static std::vector<std::string> g_list_lines = {
     "10:52 10m KH6BBB"
 };
 static int list_page = 0;
-static std::vector<std::string> g_host_lines = {
+static std::vector<std::string> g_uac_lines = {
     "HOST MODE: USB serial",
+    "Commands:",
+    "WRITEBIN <file> <size> <crc32_hex>",
+    "WRITE/APPEND",
+    "READ/DELETE",
+    "LIST/INFO/HELP",
+    "EXIT to leave"
+};
+static std::vector<std::string> g_ctrl_lines = {
+    "C MODE: USB serial",
     "Commands:",
     "WRITEBIN <file> <size> <crc32_hex>",
     "WRITE/APPEND",
@@ -343,9 +353,46 @@ int64_t rtc_now_ms();
 static void update_countdown();
 static void menu_flash_tick();
 static void rx_flash_tick();
+#if !MIC_PROBE_APP
+void log_heap(const char* tag) {
+  size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  ESP_LOGI(tag, "HEAP: free=%u min=%u largest=%u", (unsigned)free_sz, (unsigned)min_free, (unsigned)largest);
+}
+#else
+static inline void log_heap(const char*) {}
+#endif
 #if ENABLE_BLE
 static uint8_t g_own_addr_type;
 #endif
+
+// Log redirection to soft UART (G1/G2)
+static vprintf_like_t s_prev_vprintf = nullptr;
+static bool s_log_soft_uart = false;
+static int soft_uart_vprintf(const char* fmt, va_list ap) {
+  char buf[256];
+  va_list copy;
+  va_copy(copy, ap);
+  int n = vsnprintf(buf, sizeof(buf), fmt, copy);
+  va_end(copy);
+  if (n > 0) {
+    size_t to_write = (n < (int)sizeof(buf)) ? n : sizeof(buf);
+    uart_write_bytes(SOFT_UART_NUM, buf, to_write);
+  }
+  return n;
+}
+static void set_log_to_soft_uart(bool enable) {
+  if (enable && !s_log_soft_uart) {
+    s_prev_vprintf = esp_log_set_vprintf(soft_uart_vprintf);
+    s_log_soft_uart = true;
+  } else if (!enable && s_log_soft_uart) {
+    if (s_prev_vprintf) {
+      esp_log_set_vprintf(s_prev_vprintf);
+    }
+    s_log_soft_uart = false;
+  }
+}
 
 static void ensure_usb() {
   if (usb_ready) return;
@@ -1197,7 +1244,7 @@ static void host_handle_line(const std::string& line_in) {
     send("Heap: " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)));
     send("OK");
   } else if (cmd_up == "HELP") {
-    for (auto& l : g_host_lines) send(l);
+    for (auto& l : g_ctrl_lines) send(l);
     send("RX decode: press 'x' in RX to stream /kfs40m.wav");
   } else if (cmd_up == "EXIT") {
     send("OK: exit host");
@@ -1526,19 +1573,30 @@ static void enter_mode(UIMode new_mode) {
       debug_page = (int)((g_debug_lines.size() - 1) / 6);
       ui_draw_debug(g_debug_lines, debug_page);
       break;
+    case UIMode::CONTROL:
+      ui_draw_list(g_ctrl_lines, 0, -1);
+      host_input.clear();
+      ensure_usb();
+      if (usb_ready) {
+        host_write_str("READY\r\n");
+        host_write_str(std::string(HOST_PROMPT));
+      } else {
+        debug_log_line("USB serial not ready");
+      }
+      break;
     case UIMode::HOST:
       // Start UAC audio streaming
-      g_host_lines.clear();
-      g_host_lines.push_back("USB Audio Host Mode");
+      g_uac_lines.clear();
+      g_uac_lines.push_back("USB Audio Host Mode");
       if (uac_start()) {
-        g_host_lines.push_back("Starting USB host...");
-        g_host_lines.push_back("Connect 24-bit/48kHz");
-        g_host_lines.push_back("stereo USB mic");
+        g_uac_lines.push_back("Starting USB host...");
+        g_uac_lines.push_back("Connect 24-bit/48kHz");
+        g_uac_lines.push_back("stereo USB mic");
       } else {
-        g_host_lines.push_back("Failed to start UAC");
+        g_uac_lines.push_back("Failed to start UAC");
         debug_log_line("UAC start failed");
       }
-      ui_draw_list(g_host_lines, 0, -1);
+      ui_draw_list(g_uac_lines, 0, -1);
       break;
     case UIMode::LIST:
       list_page = 0;
@@ -1560,7 +1618,7 @@ static void app_task_core0(void* /*param*/) {
     .format_if_mount_failed = false
   };
   ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
-  //init_soft_uart();
+  init_soft_uart();
   ui_init();
   
   std::vector<UiRxLine> empty;
@@ -1579,6 +1637,7 @@ static void app_task_core0(void* /*param*/) {
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     debug_log_line(buf);
   }
+  log_heap("BOOT");
 
   // UI loop
   char last_key = 0;
@@ -1607,19 +1666,19 @@ static void app_task_core0(void* /*param*/) {
     if (now - last_update > pdMS_TO_TICKS(500)) {
       last_update = now;
       // Update status line (keep only header)
-      if (g_host_lines.size() > 1) {
-        g_host_lines.resize(1);
+      if (g_uac_lines.size() > 1) {
+        g_uac_lines.resize(1);
       }
-      g_host_lines.push_back(uac_get_status_string());
+      g_uac_lines.push_back(uac_get_status_string());
       if (uac_is_streaming()) {
-        g_host_lines.push_back("Decoding FT8...");
+        g_uac_lines.push_back("Decoding FT8...");
         // Show debug lines with raw USB sample data
         const char* dbg1 = uac_get_debug_line1();
         const char* dbg2 = uac_get_debug_line2();
-        if (dbg1[0]) g_host_lines.push_back(dbg1);
-        if (dbg2[0]) g_host_lines.push_back(dbg2);
+        if (dbg1[0]) g_uac_lines.push_back(dbg1);
+        if (dbg2[0]) g_uac_lines.push_back(dbg2);
       }
-      ui_draw_list(g_host_lines, 0, -1);
+      ui_draw_list(g_uac_lines, 0, -1);
     }
     // Handle keyboard - only 'h'/'H' to exit
     if (c == 0) {
@@ -1633,6 +1692,30 @@ static void app_task_core0(void* /*param*/) {
     }
     last_key = c;
     if (c == 'h' || c == 'H') {
+      enter_mode(UIMode::RX);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    continue;
+  }
+
+  // CONTROL mode: legacy host serial protocol over USB (and BLE)
+  if (ui_mode == UIMode::CONTROL) {
+    poll_host_uart();
+    if (host_bin_active) { // block keyboard exits during binary upload
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    if (c == 0) {
+      last_key = 0;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    if (c == last_key) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    last_key = c;
+    if (c == 'c' || c == 'C' || c == 'h' || c == 'H') {
       enter_mode(UIMode::RX);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1666,6 +1749,7 @@ static void app_task_core0(void* /*param*/) {
 
   // Toggle UAC decode with 'x' (start; no stop to avoid crash). On stop, decode runs idle.
   if (c == 'x' || c == 'X') {
+    set_log_to_soft_uart(true);
     if (uac_is_streaming()) {
       debug_log_line("UAC already streaming");
     } else if (uac_start()) {
@@ -1699,7 +1783,8 @@ static void app_task_core0(void* /*param*/) {
       else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
       else if (c == 'b' || c == 'B') { cancel_status_edit(); enter_mode(ui_mode == UIMode::BAND ? UIMode::RX : UIMode::BAND); switched = true; }
       else if (c == 'm' || c == 'M') { cancel_status_edit(); enter_mode(ui_mode == UIMode::MENU ? UIMode::RX : UIMode::MENU); switched = true; }
-      else if (c == 'h' || c == 'H') { cancel_status_edit(); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
+      else if (c == 'h' || c == 'H') { cancel_status_edit(); set_log_to_soft_uart(true); enter_mode(ui_mode == UIMode::HOST ? UIMode::RX : UIMode::HOST); switched = true; }
+      else if (c == 'c' || c == 'C') { cancel_status_edit(); set_log_to_soft_uart(false); enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL); switched = true; }
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 'l' || c == 'L') { cancel_status_edit(); enter_mode(ui_mode == UIMode::LIST ? UIMode::RX : UIMode::LIST); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
@@ -1858,6 +1943,8 @@ static void app_task_core0(void* /*param*/) {
           }
           break;
         }
+        case UIMode::CONTROL:
+          break;
         case UIMode::HOST:
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
