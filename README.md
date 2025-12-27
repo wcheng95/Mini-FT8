@@ -1,3 +1,7 @@
+# 2nd milestone (v0.3 2025-12-26)
+Mini-FT8 can reliably decode multiple messages from QMX. CAT port is ready for QMX TX, sleep mode is added to turn off M5 Cardputer when charging.
+![Decoding multiple messages from QMX](IMG_5229.png)
+
 # First milestone (v0.1 2025-12-24)
 With help from Zhenxing, N6HAN, we have our first on air ft8 message decoded on M5 Cardputer
 ![First on air FT8 decoded message](IMG_5208.png)
