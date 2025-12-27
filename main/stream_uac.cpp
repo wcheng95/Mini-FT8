@@ -28,6 +28,7 @@ extern void log_heap(const char* tag);
 
 // External references from main.cpp
 extern bool g_streaming;
+extern bool g_decode_enabled;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 int64_t rtc_now_ms();
 
@@ -639,7 +640,11 @@ static void stream_uac_task(void* arg) {
                 } else if (slot_blocks >= 79 && mon.wf.num_blocks >= 79) {
                     ESP_LOGI(TAG, "Triggering decode at slot %lld blocks=%d wf=%d",
                              (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
-                    decode_monitor_results(&mon, &mon_cfg, false);
+                    if (g_decode_enabled) {
+                        decode_monitor_results(&mon, &mon_cfg, false);
+                    } else {
+                        ESP_LOGI(TAG, "Decode paused; skipping");
+                    }
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;
                     slot_blocks = 0;

@@ -328,6 +328,7 @@ static bool g_skip_tx1 = false;
 static std::string g_free_text = "DE AG6AQ CM97";
 static std::string g_call = "AG6AQ";
 static std::string g_grid = "CM97";
+bool g_decode_enabled = true;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::NONE;
 static std::string g_ant = "EFHW";
@@ -1783,12 +1784,14 @@ static void app_task_core0(void* /*param*/) {
   menu_flash_tick();
   rx_flash_tick();
 
-  // Toggle UAC decode with 'x' (start; no stop to avoid crash). On stop, decode runs idle.
+  // Toggle UAC decode with 'x': start if not streaming; otherwise toggle decode on/off.
   if (c == 'x' || c == 'X') {
     set_log_to_soft_uart(true);
     if (uac_is_streaming()) {
-      debug_log_line("UAC already streaming");
+      g_decode_enabled = !g_decode_enabled;
+      debug_log_line(g_decode_enabled ? "Decode resumed" : "Decode paused");
     } else if (uac_start()) {
+      g_decode_enabled = true;
       debug_log_line("UAC start");
     } else {
       debug_log_line("UAC start failed");
@@ -1900,10 +1903,16 @@ static void app_task_core0(void* /*param*/) {
           break;
         }
         case UIMode::STATUS: {
-            if (status_edit_idx == -1) {
-              if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
-              else if (c == '2') { status_edit_idx = 1; status_edit_buffer.clear(); draw_status_view(); }
-              else if (c == '3') { g_band_sel = (g_band_sel + 1) % g_bands.size(); save_station_data(); draw_status_view(); }
+        if (status_edit_idx == -1) {
+          if (c == '1') { g_beacon = (BeaconMode)(((int)g_beacon + 1) % 5); save_station_data(); draw_status_view(); }
+          else if (c == '2') { status_edit_idx = 1; status_edit_buffer.clear(); draw_status_view(); }
+          else if (c == '3') {
+            g_band_sel = (g_band_sel + 1) % g_bands.size();
+            g_decode_enabled = false; // pause RX when changing band
+            save_station_data();
+            draw_status_view();
+            debug_log_line("Decode paused after band change");
+          }
               else if (c == '4') {
                 g_tune = !g_tune;
                 const char* cmd = g_cat_toggle_high ? "FA00007074000;" : "FA00014074000;";

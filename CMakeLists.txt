@@ -4,4 +4,5 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mini_ft8)
-spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs_image FLASH_IN_PROJECT)
+# Build SPIFFS image, but do NOT include it in default flash target (preserve on-device files)
+spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs_image)
