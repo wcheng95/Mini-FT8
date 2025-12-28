@@ -18,6 +18,7 @@ extern "C" {
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 #include "tx_queue.h"
+#include "active_calls.h"
 #include <M5Cardputer.h>
 #include <sstream>
 #include <iterator>
@@ -40,7 +41,6 @@ extern "C" {
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "stream_uac.h"
-#include "active_calls.h"
 #define ENABLE_BLE 0
 
 #if ENABLE_BLE
@@ -226,6 +226,8 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS };
 static UIMode ui_mode = UIMode::RX;
+static int tx_page = 0;
+static int tx_selected_idx = -1;  // index into tx_queue (not including tx_next)
 static std::vector<UiRxLine> g_rx_lines;
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 static const char* STATION_FILE = "/spiffs/StationData.ini";
@@ -554,7 +556,21 @@ struct WAVHeader {
   return ESP_OK;
 }
 
-static void redraw_tx_view() {}
+static void redraw_tx_view() {
+  std::vector<std::string> qtext;
+  std::vector<bool> marks;
+  std::vector<int> slots;
+  qtext.reserve(tx_queue.size());
+  marks.reserve(tx_queue.size());
+  slots.reserve(tx_queue.size() + 1);
+  for (auto &e : tx_queue) {
+    qtext.push_back(tx_entry_display(e, true)); // queue lines show repeat counter for normal entries
+    marks.push_back(e.mark_delete);
+    slots.push_back(e.slot_id & 1);
+  }
+  slots.insert(slots.begin(), tx_next.slot_id & 1); // slot for next at index 0
+  ui_draw_tx(tx_entry_display(tx_next, false /*for_queue*/), qtext, tx_page, tx_selected_idx, marks, slots);
+}
 
 static void draw_band_view() {
   std::vector<std::string> lines;
@@ -962,29 +978,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
                         rc == FTX_MESSAGE_RC_OK ? call_de : nullptr,
                         rc == FTX_MESSAGE_RC_OK ? extra : nullptr);
             if (!mycall_up.empty() && to_upper(ui_lines[idx].field1) == mycall_up) {
-            int rx_snr = ui_lines[idx].snr;
-            int msg_step = 0;
-            bool signoff = false;
-            if (!ui_lines[idx].field3.empty()) {
-              if (ui_lines[idx].field3 == "RRR" || ui_lines[idx].field3 == "RR73" || ui_lines[idx].field3 == "73") {
-                msg_step = 4;
-              } else if (ui_lines[idx].field3.size() > 0 && (ui_lines[idx].field3[0] == 'R' || ui_lines[idx].field3[0] == 'r')) {
-                msg_step = 2; // report with leading R (TX3)
-              } else if (is_grid4(ui_lines[idx].field3)) {
-                msg_step = 1; // grid
-              } else {
-                msg_step = 2; // plain report
-              }
-              if (ui_lines[idx].field3 == "RRR" || ui_lines[idx].field3 == "RR73") signoff = true;
-            }
-            ActiveCall* existing = active_calls_find(ui_lines[idx].field2);
-            if (existing || msg_step == 1 || msg_step == 2) {
-              int rpt_report = (msg_step == 2) ? parse_report_snr(ui_lines[idx].field3) : -99;
-              int rpt = (rpt_report != -99) ? rpt_report
-                        : (existing && existing->rpt_snr != -99 ? existing->rpt_snr : rx_snr);
-              active_calls_touch(ui_lines[idx].field2, ui_lines[idx].field3, rx_snr, rpt,
-                                 ui_lines[idx].offset_hz, ui_lines[idx].slot_id, msg_step == 0 ? 1 : msg_step, signoff && existing);
-            }
+            // active call tracking disabled
           }
           }
           continue;
@@ -1004,39 +998,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
         std::string f1_up = to_upper(line.field1);
         if (!mycall_up.empty() && f1_up == mycall_up) {
           line.is_to_me = true;
-          // For peer reports (R-xx/RR73/73), rx_snr=our measurement, rpt_snr unknown yet (-99)
-          int rx_snr = line.snr;
-          bool signoff = (line.field3 == "RRR" || line.field3 == "RR73");
-          int msg_step = 0;
-          if (!line.field3.empty()) {
-            if (line.field3 == "RRR" || line.field3 == "RR73" || line.field3 == "73") msg_step = 4;
-            else if (!line.field3.empty() && (line.field3[0] == 'R' || line.field3[0] == 'r')) msg_step = 2; // report with R
-            else if (is_grid4(line.field3)) msg_step = 1;           // grid
-            else msg_step = 2; // report
-          }
-          ActiveCall* existing = active_calls_find(line.field2);
-          if (existing || msg_step == 1 || msg_step == 2) {
-            int rpt_report = (msg_step == 2) ? parse_report_snr(line.field3) : -99;
-            int rpt = (rpt_report != -99) ? rpt_report
-                      : (existing && existing->rpt_snr != -99 ? existing->rpt_snr : rx_snr);
-            active_calls_touch(line.field2, line.field3, rx_snr, rpt,
-                               line.offset_hz, line.slot_id, msg_step == 0 ? 1 : msg_step, signoff && existing);
-            // Auto enqueue reply based on their step
-            int next_step = 0;
-            if (msg_step == 1) {
-              if (rpt == -99) rpt = rx_snr;
-              next_step = 2;
-            } else if (msg_step == 2) {
-              if (rpt == -99) rpt = rx_snr;
-              next_step = 3;
-            } else if (msg_step == 4 && existing) {
-              next_step = 5; // send 73 after RR73
-            }
-            if (next_step > 0) {
-              TxEntry te = make_tx_entry(next_step, line.field2, rpt, line.slot_id ^ 1, line.offset_hz);
-              tx_enqueue(te);
-            }
-          }
+          // active call tracking disabled
         }
         ui_lines.push_back(line);
         seen_idx[text_str] = (int)ui_lines.size() - 1;
@@ -1167,13 +1129,11 @@ static void tx_send_task(void* param) {
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  int64_t slot_idx = rtc_now_ms() / 15000;
   for (int i = 0; i < 79; ++i) {
     ESP_LOGI("TXTONE", "%02d %u", i, (unsigned)tones[i]);
     fft_waterfall_tx_tone(tones[i]);
     vTaskDelay(pdMS_TO_TICKS(160));
   }
-  tx_engine_mark_sent(*e, slot_idx);
   tx_task_running = false;
   vTaskDelete(NULL);
 }
@@ -1860,6 +1820,8 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_rx();
       break;
     case UIMode::TX:
+      tx_page = 0;
+      tx_selected_idx = -1;
       redraw_tx_view();
       break;
     case UIMode::BAND:
@@ -1929,7 +1891,6 @@ static void app_task_core0(void* /*param*/) {
   ui_set_rx_list(empty);
   ui_draw_rx();
   tx_init();
-  tx_engine_reset();
   ui_mode = UIMode::RX;
   load_station_data();
 
@@ -2127,6 +2088,23 @@ static void app_task_core0(void* /*param*/) {
           break;
         }
         case UIMode::TX: {
+          int start_idx = tx_page * 5;
+          if (c == ';') {
+            if (tx_page > 0) { tx_page--; redraw_tx_view(); }
+          } else if (c == '.') {
+            if (start_idx + 5 < (int)tx_queue.size()) { tx_page++; redraw_tx_view(); }
+          } else if (c == '1') {
+            if (start_idx < (int)tx_queue.size()) { tx_next = tx_queue[start_idx]; redraw_tx_view(); }
+          } else if (c == 'e' || c == 'E') {
+            encode_and_log_tx_next();
+          } else if (c >= '2' && c <= '6') {
+            int line = c - '2'; // 0..4
+            int idx = start_idx + line;
+            if (idx >= 0 && idx < (int)tx_queue.size()) {
+              tx_queue[idx].mark_delete = !tx_queue[idx].mark_delete;
+              redraw_tx_view();
+            }
+          }
           break;
         }
         case UIMode::BAND: {
