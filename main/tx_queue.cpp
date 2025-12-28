@@ -1,4 +1,6 @@
 #include "tx_queue.h"
+#include <algorithm>
+#include "esp_log.h"
 
 TxEntry tx_next;
 std::vector<TxEntry> tx_queue;
@@ -42,3 +44,6 @@ std::string tx_entry_display(const TxEntry& e, bool for_queue) {
     }
     return base;
 }
+
+// ---------------- TX Engine placeholder ----------------
+// Temporarily unhooked; scheduling/transmit handled elsewhere.
