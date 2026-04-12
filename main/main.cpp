@@ -3276,6 +3276,11 @@ static void gps_tick() {
         changed = true;
         g_last_gps_sync_ms = now;
         ESP_LOGI(TAG, "GPS Time Synced: %s %s", g_date.c_str(), g_time.c_str());
+        
+        int h = 0, m = 0, s = 0;
+        if (sscanf(st.time_utc.c_str(), "%d:%d:%d", &h, &m, &s) == 3) {
+            radio_control_set_time(h, m, s);
+        }
       }
     }
   }

@@ -89,6 +89,16 @@ static esp_err_t qmx_on_audio_start(void) {
     return ESP_OK;
 }
 
+static esp_err_t qmx_set_time(int hour, int minute, int second) {
+    char tm[32];
+    snprintf(tm, sizeof(tm), "TM%02d%02d%02d;", hour, minute, second);
+    esp_err_t err = qmx_send_cmd(tm, 200);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "QMX CAT time set: %02d:%02d:%02d", hour, minute, second);
+    }
+    return err;
+}
+
 static const radio_control_ops_t k_ops = {
     .name = "qmx",
     .ready = qmx_ready,
@@ -98,6 +108,7 @@ static const radio_control_ops_t k_ops = {
     .set_tone_hz = qmx_set_tone_hz,
     .end_tx = qmx_end_tx,
     .set_tune = qmx_set_tune,
+    .set_time = qmx_set_time,
 };
 
 const radio_control_ops_t* radio_control_qmx_get_ops(void) {

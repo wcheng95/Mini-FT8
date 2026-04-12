@@ -80,3 +80,9 @@ esp_err_t radio_control_set_tune(bool enable, int freq_hz, int tone_hz) {
     if (!ops || !ops->set_tune) return ESP_ERR_INVALID_STATE;
     return ops->set_tune(enable, freq_hz, tone_hz);
 }
+
+esp_err_t radio_control_set_time(int hour, int minute, int second) {
+    const radio_control_ops_t* ops = current_ops();
+    if (!ops || !ops->set_time) return ESP_ERR_NOT_SUPPORTED;
+    return ops->set_time(hour, minute, second);
+}

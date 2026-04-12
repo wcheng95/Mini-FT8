@@ -13,6 +13,7 @@ typedef struct {
     esp_err_t (*set_tone_hz)(float tone_hz);
     esp_err_t (*end_tx)(void);
     esp_err_t (*set_tune)(bool enable, int freq_hz, int tone_hz);
+    esp_err_t (*set_time)(int hour, int minute, int second);
 } radio_control_ops_t;
 
 const radio_control_ops_t* radio_control_qmx_get_ops(void);

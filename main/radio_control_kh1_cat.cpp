@@ -186,6 +186,7 @@ static const radio_control_ops_t k_ops = {
     .set_tone_hz = kh1_set_tone_hz,
     .end_tx = kh1_end_tx,
     .set_tune = kh1_set_tune,
+    .set_time = nullptr,
 };
 
 const radio_control_ops_t* radio_control_kh1_get_ops(void) {

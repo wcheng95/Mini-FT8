@@ -25,6 +25,7 @@ esp_err_t radio_control_begin_tx(int freq_hz, int tx_base_hz);
 esp_err_t radio_control_set_tone_hz(float tone_hz);
 esp_err_t radio_control_end_tx(void);
 esp_err_t radio_control_set_tune(bool enable, int freq_hz, int tone_hz);
+esp_err_t radio_control_set_time(int hour, int minute, int second);
 
 #ifdef __cplusplus
 }
