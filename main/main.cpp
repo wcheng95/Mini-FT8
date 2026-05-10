@@ -72,7 +72,7 @@ static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
 
-#define ENABLE_BLE 1
+#include "feature_flags.h"
 
 #if ENABLE_BLE
 #include "nimble/nimble_port.h"
