@@ -1,6 +1,7 @@
 #include "stream_uac.h"
 #include "ft8_audio_pipeline.h"
 #include "resample.h"
+#include "feature_flags.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,7 +33,7 @@ int64_t rtc_now_ms();
 #define UAC_TASK_PRIORITY       5
 #define UAC_STREAM_TASK_PRIORITY 4
 #define TASK_STACK_SIZE         4096
-#define STREAM_TASK_STACK_SIZE  8192
+#define STREAM_TASK_STACK_SIZE  STREAM_TASK_STACK_BYTES  // variant-specific: see feature_flags.h
 
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
 // 288 bytes = 48 stereo samples per 1ms USB transfer, 2304 = 288 * 8
