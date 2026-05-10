@@ -5559,6 +5559,13 @@ static bool    g_qmx_detect_active     = false;
 static int64_t g_qmx_detect_deadline_ms = 0;
 static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 
+// CDC-FAIL watchdog: armed when UAC audio comes up (QMX mic detected) but CAT
+// CDC hasn't connected yet. Fires 10 s later; if CDC is still absent, logs a
+// warning (JTAG serial is still up even when USB host mode blocks CDC).
+static bool    g_cdc_check_active      = false;
+static int64_t g_cdc_check_deadline_ms = 0;
+static constexpr int64_t kCdcCheckDelayMs = 10000;
+
 // Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
 // BLE controller memory is released and USB-OTG is re-claimed as a device
 // port until reboot.
@@ -5822,6 +5829,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   ui_mode = UIMode::RX;
   load_station_data();
   init_bluetooth();
+  // Boot-time DRAM headroom check. NimBLE can consume ~50 KB of internal DRAM;
+  // if free DIRAM falls below 30 KB after init the CDC-ACM allocator will likely
+  // fail silently when the QMX enumerates. Surface this immediately on the startup
+  // screen (visible without a serial connection) so the failure mode is obvious.
+  {
+    size_t free_diram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    constexpr size_t kDiramWarnThresholdBytes = 30 * 1024;
+    if (free_diram < kDiramWarnThresholdBytes) {
+      char warn[32];
+      snprintf(warn, sizeof(warn), "LOW DRAM: %u KB", (unsigned)(free_diram / 1024));
+      ESP_LOGW(TAG, "%s (MALLOC_CAP_INTERNAL|8BIT) — CDC-ACM may fail to allocate", warn);
+      g_startup_lines.push_back(warn);
+      ui_draw_debug(g_startup_lines, 0);  // repaint splash with the warning appended
+    }
+  }
   apply_ble_enabled_policy(true);
   apply_radio_profile_binding();
   update_autoseq_cq_type();
@@ -6030,6 +6052,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       if (audio_source_qmx_detected()) {
         g_qmx_detect_active = false;
         ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
+        // Arm CDC-FAIL watchdog: if CAT CDC doesn't connect within 10 s of
+        // audio coming up, log a warning (suggests CDC-ACM allocation failure,
+        // often caused by DRAM pressure from NimBLE).
+        if (!cat_cdc_ready()) {
+          g_cdc_check_deadline_ms = esp_timer_get_time() / 1000 + kCdcCheckDelayMs;
+          g_cdc_check_active = true;
+        }
       } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
         if (storage_supports_msc()) {
           enter_msc_mode("no QMX after 10s");
@@ -6037,6 +6066,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           g_qmx_detect_active = false;
           ESP_LOGI(TAG, "No QMX detected after 10s — staying in RX (MSC unavailable on launcher install)");
         }
+      }
+    }
+
+    // CDC-FAIL watchdog: fires 10 s after QMX audio enumerated without CAT CDC.
+    // Clears once CDC connects (normal case) or after the warning fires once.
+    if (g_cdc_check_active) {
+      if (cat_cdc_ready()) {
+        g_cdc_check_active = false;  // connected normally, all good
+      } else if (esp_timer_get_time() / 1000 >= g_cdc_check_deadline_ms) {
+        g_cdc_check_active = false;
+        size_t free_diram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "CDC FAIL: CAT CDC not ready 10s after QMX audio connect "
+                      "(free DIRAM=%u KB) — likely CDC-ACM allocation failure due to DRAM pressure",
+                      (unsigned)(free_diram / 1024));
       }
     }
 
