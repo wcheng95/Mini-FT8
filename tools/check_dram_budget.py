@@ -37,20 +37,31 @@ DEFAULT_VARIANT = "ft8"
 
 
 def run_idf_size(build_dir: Path) -> dict | None:
-    """Run `idf.py size --format json` and return parsed JSON, or None on failure."""
+    """Invoke esp_idf_size directly on the project .map file and return parsed JSON.
+
+    Calling `idf.py size` would recursively reinvoke the build system and breaks
+    on Windows (CreateProcess can't launch a .py shebang). Calling the sizer
+    module directly with the current interpreter avoids both problems.
+    """
+    map_files = list(build_dir.glob("*.map"))
+    if not map_files:
+        print(f"[check_dram_budget] No .map file in {build_dir}; skipping check.")
+        return None
+    map_file = map_files[0]
     try:
         result = subprocess.run(
-            ["idf.py", "-B", str(build_dir), "size", "--format", "json"],
+            [sys.executable, "-m", "esp_idf_size", "--format", "json", str(map_file)],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=60,
         )
         if result.returncode != 0:
-            print(f"[check_dram_budget] idf.py size failed (rc={result.returncode}); skipping check.")
+            print(f"[check_dram_budget] esp_idf_size failed (rc={result.returncode}): "
+                  f"{result.stderr.strip()}; skipping check.")
             return None
         return json.loads(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        print(f"[check_dram_budget] Could not run idf.py size: {e}; skipping check.")
+        print(f"[check_dram_budget] Could not run esp_idf_size: {e}; skipping check.")
         return None
 
 
