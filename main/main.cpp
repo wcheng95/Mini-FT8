@@ -1401,6 +1401,15 @@ OffsetSrc g_offset_src = OffsetSrc::RANDOM;  // visible to core_api.cpp
 RadioType g_radio = RadioType::QMX;          // visible to core_api.cpp
 static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
+// GPS hardware source. PORTA (Grove AT6668) is the original wiring; CAP1262 is
+// the LoRa-1262 stacking cap whose ATGM336H GNSS sits on UART2/G15-G13 at a
+// fixed 115200 baud. OFF disables GPS entirely.
+enum class GpsSource : uint8_t {
+    OFF     = 0,
+    PORTA   = 1,
+    CAP1262 = 2,
+};
+static GpsSource g_gps_source = GpsSource::PORTA;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
 std::string g_comment1 = "MiniFT8 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
@@ -1413,6 +1422,7 @@ static bool radio_type_uses_display_only(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 void apply_radio_profile_binding();   // visible to core_api.cpp
 static void gps_runtime_tick();
+static gps_pins_t gps_pins_for_source(GpsSource src, int porta_preload_baud);
 static std::string expand_comment_macros(const std::string& src);
 static std::string normalize_grid_maidenhead(const std::string& src);
 // Non-static so core_api.cpp's set_call / set_grid RPCs can refresh the
@@ -2095,9 +2105,15 @@ static void poll_uart_inject_keys() {
   if (!s_key_inject_queue) return;
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
-  // pins TX=GPIO13, RX=GPIO15 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
+  // pins TX=GPIO4, RX=GPIO5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
   // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
-  // UART1 peripheral on GPIO1 — no conflict.
+  // UART1 on GPIO1/2, and the CAP-1262 GPS uses UART2 on GPIO13/15 —
+  // no conflicts with the console.
+  // Caveat: the CAP-1262's SX1262 NSS sits on GPIO5 and DIO1 on GPIO4
+  // (same pins as the console). Mini-FT8 never drives the SX1262 (its
+  // RST on GPIO3 is left low), so the chip stays in reset and ignores
+  // console traffic — fine in practice but worth knowing if you ever
+  // wire up LoRa.
   uart_dev_t *hw = UART_LL_GET_HW(0);
   while (true) {
     uint32_t avail = uart_ll_get_rxfifo_len(hw);
@@ -2465,20 +2481,30 @@ void apply_radio_profile_binding() {
   audio_source_backend_t prev_audio = audio_source_get_backend();
   g_radio = canonical_radio_type(g_radio);
   g_gps_baud = normalize_gps_baud_value(g_gps_baud);
+  // KH1 CAT and PORTA-source GPS both want UART_NUM_1 on G1/G2, so they're
+  // mutually exclusive. CAP1262 GPS lives on UART_NUM_2 / G15-G13 and coexists
+  // with KH1 freely. OFF means no GPS at all.
+  const bool gps_on_porta = (g_gps_source == GpsSource::PORTA);
+  const bool gps_enabled  = (g_gps_source != GpsSource::OFF);
+  auto start_gps_if_enabled = [&]() {
+    if (gps_enabled) gps_start(gps_pins_for_source(g_gps_source, g_gps_baud));
+  };
   if (is_kh1_radio(g_radio)) {
-    // KH1 mode is explicit-connect: GPS keeps UART1 until user presses Connect to KH1.
+    // KH1 mode is explicit-connect: PORTA-GPS keeps UART1 until user presses Connect to KH1.
     if (g_kh1_connected) {
-      gps_stop();
+      if (gps_on_porta) gps_stop();
       radio_control_kh1_set_enabled(true);
+      // CAP1262 GPS (if selected) is on UART2 and unaffected.
+      if (!gps_on_porta) start_gps_if_enabled();
     } else {
       radio_control_kh1_set_enabled(false);
-      gps_start(g_gps_baud);
+      start_gps_if_enabled();
     }
   } else {
-    // Leaving KH1 releases UART1 back to GPS.
+    // Leaving KH1 releases UART1 back to PORTA-GPS (if selected).
     g_kh1_connected = false;
     radio_control_kh1_set_enabled(false);
-    gps_start(g_gps_baud);
+    start_gps_if_enabled();
   }
   RadioProfileBinding binding = get_radio_profile_binding(g_radio);
   audio_source_set_backend(binding.audio_backend);
@@ -2671,7 +2697,11 @@ static void gps_runtime_tick() {
   static bool s_gps_grid_logged = false;
   static int s_last_time_sync_hour_key = -1;
 
-  if (is_kh1_radio(g_radio) && g_kh1_connected) return;
+  // PORTA shares UART1 with KH1 CAT, so it must yield when KH1 is connected.
+  // CAP1262 lives on UART2 and is independent — keep ticking so we drain its
+  // FIFO and run self-heal even with KH1 active.
+  if (is_kh1_radio(g_radio) && g_kh1_connected &&
+      g_gps_source != GpsSource::CAP1262) return;
 
   gps_tick();
 
@@ -2849,6 +2879,60 @@ static std::string normalize_time_hms(const std::string& src) {
 
 static int normalize_gps_baud_value(int value) {
   return (value == 9600 || value == 115200) ? value : 115200;
+}
+
+static GpsSource canonical_gps_source(int v) {
+  switch (v) {
+    case 0: return GpsSource::OFF;
+    case 2: return GpsSource::CAP1262;
+    case 1:
+    default: return GpsSource::PORTA;
+  }
+}
+
+static const char* gps_source_short_name(GpsSource s) {
+  switch (s) {
+    case GpsSource::OFF:     return "Off";
+    case GpsSource::CAP1262: return "CAP";
+    case GpsSource::PORTA:
+    default:                 return "PORTA";
+  }
+}
+
+static GpsSource gps_source_next(GpsSource s) {
+  switch (s) {
+    case GpsSource::PORTA:   return GpsSource::CAP1262;
+    case GpsSource::CAP1262: return GpsSource::OFF;
+    case GpsSource::OFF:
+    default:                 return GpsSource::PORTA;
+  }
+}
+
+// CAP-1262 stacking cap (ATGM336H) lives on a separate UART peripheral and pin
+// pair from PORTA so it can coexist with KH1 CAT. Baud is auto-probed because
+// the ATGM336H ships at 9600 from the factory and we don't know whether the
+// M5 cap firmware has reconfigured it to 115200.
+static gps_pins_t gps_pins_for_source(GpsSource src, int porta_preload_baud) {
+  gps_pins_t p{};
+  switch (src) {
+    case GpsSource::CAP1262:
+      p.uart         = UART_NUM_2;
+      p.rx           = GPIO_NUM_15;
+      p.tx           = GPIO_NUM_13;
+      p.default_baud = 115200;
+      p.auto_baud    = true;
+      break;
+    case GpsSource::PORTA:
+    case GpsSource::OFF:    // caller guards against starting when OFF
+    default:
+      p.uart         = UART_NUM_1;
+      p.rx           = GPIO_NUM_1;
+      p.tx           = GPIO_NUM_2;
+      p.default_baud = normalize_gps_baud_value(porta_preload_baud);
+      p.auto_baud    = true;
+      break;
+  }
+  return p;
 }
 
 static std::string normalize_date_ymd(const std::string& src) {
@@ -4179,7 +4263,14 @@ static std::string status_sync_line() {
     }
     const bool cat_ready = radio_control_ready();
     if (cat_ready && streaming) return std::string("Sync ") + name + "(RX+TX)";
-    if (cat_ready && !streaming) return std::string("Sync ") + name + "(TX)";
+    if (cat_ready && !streaming) {
+      const char* uac = audio_source_get_status_string();
+      // The enumeration string ("vvvv:pppp Px iNoM") starts with a hex digit
+      // and is self-describing; adding a "UAC: " prefix would clip the tail on
+      // the 20-char-wide display.
+      if (uac && std::isxdigit((unsigned char)uac[0])) return std::string(uac);
+      return std::string("UAC: ") + (uac ? uac : "?");
+    }
     return std::string("Connect ") + name;
   }
   if (streaming) return std::string("Sync to ") + radio_name(radio);
@@ -4192,17 +4283,45 @@ static void draw_gps_view(bool force_redraw) {
   std::vector<std::string> lines;
   lines.reserve(6);
   gps_state_t state = gps_get_state();
-  lines.push_back("--- GPS TELEMETRY ---");
+  lines.push_back(std::string("Src:") + gps_source_short_name(g_gps_source) + "  (1=next)");
   if (state.valid_fix) {
     lines.push_back(std::string("Fix: 3D (") + std::to_string(state.satellites) + " Sats)");
   } else {
-    lines.push_back(std::string("Fix: NO FIX (") + std::to_string(state.satellites) + " Sats)");
+    // No fix: show GGA fix quality (Q) and GSV sats-in-view (V). Together they
+    // pinpoint where the chain breaks:
+    //   Q:0 V:0   antenna deaf — chip hears nothing (sky/antenna/RF problem)
+    //   Q:0 V:N   chip hears N sats but no PVT solution (weak signal or cold start)
+    //   Q>0 V:N   chip says it has a fix, but no RMC=A yet (sentence config?)
+    char ln[24];
+    snprintf(ln, sizeof(ln), "NoFix Q:%d V:%d",
+             state.gga_fix_quality, state.satellites_in_view);
+    lines.push_back(ln);
   }
   lines.push_back(std::string("Time: ") + (state.time_utc.empty() ? "Wait..." : state.time_utc));
   lines.push_back(std::string("Grid: ") + (state.grid_square.empty() ? "----" : state.grid_square));
-  char loc[64];
-  snprintf(loc, sizeof(loc), "L: %.3f, %.3f", state.latitude, state.longitude);
-  lines.push_back(loc);
+  if (state.valid_fix) {
+    char loc[64];
+    snprintf(loc, sizeof(loc), "L: %.3f, %.3f", state.latitude, state.longitude);
+    lines.push_back(loc);
+  } else {
+    // CAP-1262 diagnostic: Rx byte total + lock flag tell us "chip silent"
+    // (Rx stuck) vs "bytes flowing but unparseable" (Rx climbs, L=0).
+    // Uptime (Up) gives wait-time context — cold-start TTFF can be 30-60 s
+    // with sky view, 5+ min near a window. Display is 20 cols.
+    char dbg[32];
+    const uint32_t bytes = state.total_rx_bytes;
+    const uint32_t up_s = (state.started_at_ms == 0)
+        ? 0
+        : ((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - state.started_at_ms) / 1000;
+    if (bytes < 100000) {
+      snprintf(dbg, sizeof(dbg), "Up:%us Rx:%uB L%d",
+               (unsigned)up_s, (unsigned)bytes, state.baud_locked ? 1 : 0);
+    } else {
+      snprintf(dbg, sizeof(dbg), "Up:%us Rx:%uk L%d",
+               (unsigned)up_s, (unsigned)(bytes / 1000), state.baud_locked ? 1 : 0);
+    }
+    lines.push_back(dbg);
+  }
   if (state.last_rx_ms > 0) {
     uint32_t diff = (xTaskGetTickCount() * portTICK_PERIOD_MS - state.last_rx_ms) / 1000;
     lines.push_back(std::string("Sync: Good (") + std::to_string(diff) + "s ago)");
@@ -5636,6 +5755,7 @@ static void load_station_data() {
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
   g_ble_enabled = true;
   g_gps_baud = 115200;
+  g_gps_source = GpsSource::PORTA;
   g_grid_saved_manual = g_grid;
   g_grid_from_gps = false;
   g_grid_gps_display8.clear();
@@ -5679,6 +5799,8 @@ static void load_station_data() {
       g_radio = parse_radio_config_value(line + 6);
     } else if (sscanf(line, "gps_baud=%d", &val) == 1) {
       g_gps_baud = normalize_gps_baud_value(val);
+    } else if (sscanf(line, "gps_source=%d", &val) == 1) {
+      g_gps_source = canonical_gps_source(val);
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
       g_cq_freetext = trim_upper_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
@@ -5763,6 +5885,7 @@ void save_station_data() {
   out << "offset_src=" << (int)g_offset_src << "\n";
   out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
   out << "gps_baud=" << normalize_gps_baud_value(g_gps_baud) << "\n";
+  out << "gps_source=" << (int)g_gps_source << "\n";
   out << "comment1=" << g_comment1 << "\n";
   out << "ignore_prefixes=" << g_ignore_prefix_text << "\n";
   out << "rxtx_log=" << (g_rxtx_log ? 1 : 0) << "\n";
@@ -6147,23 +6270,27 @@ static void begin_usb_host_mode() {
     apply_radio_profile_binding();
   }
   if (!audio_source_is_streaming()) {
-    debug_log_line("UAC2 start");
+    ESP_LOGI(TAG, "UAC2 start");
     apply_radio_profile_binding();
     const char* backend = audio_source_backend_name(audio_source_get_backend());
     const bool is_uac_backend = (std::strstr(backend, "uac") != nullptr);
-    debug_log_line("UAC2 bind");
+    ESP_LOGI(TAG, "UAC2 bind backend=%s", backend);
     if (is_uac_backend) log_mem_caps("UAC_BEFORE_START");
     if (!audio_source_start()) {
       if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
       debug_log_line("UAC2 afail");
     } else {
       if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
-      debug_log_line("UAC2 aok");
+      ESP_LOGI(TAG, "UAC2 aok");
       g_decode_enabled = true;
       ui_set_paused(false);
       ui_clear_waterfall();
       esp_err_t rc = radio_control_on_audio_start();
-      debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
+      if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "UAC2 catok");
+      } else {
+        debug_log_line("UAC2 catng");
+      }
       // Headless-friendly fallback: arm a 10 s "no-QMX" timer when the
       // selected radio is QMX. If neither the UAC mic nor the CDC-ACM
       // endpoint enumerates by then, the main loop enters MSC so the PC
@@ -6814,7 +6941,19 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   if (!switched && c) {
     // Mode-specific handling
     switch (ui_mode) {
-      case UIMode::GPS: break;
+      case UIMode::GPS: {
+        if (c == '1') {
+          // Cycle the GPS source: PORTA -> CAP1262 -> OFF -> PORTA.
+          // Stop the old source first so its UART driver is released before
+          // apply_radio_profile_binding() installs the new one.
+          gps_stop();
+          g_gps_source = gps_source_next(g_gps_source);
+          save_station_data();
+          apply_radio_profile_binding();
+          draw_gps_view(true);
+        }
+        break;
+      }
       case UIMode::PERF: break;
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
