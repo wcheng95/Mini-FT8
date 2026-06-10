@@ -14,17 +14,21 @@
 
 namespace {
 
-constexpr uart_port_t kGpsUartNum = UART_NUM_1;
-constexpr gpio_num_t kGpsTxPin = GPIO_NUM_2;
-constexpr gpio_num_t kGpsRxPin = GPIO_NUM_1;
 constexpr int kGpsBaudFast = 115200;
 constexpr int kGpsBaudSlow = 9600;
 constexpr size_t kGpsLineMax = 128;
 constexpr uint32_t kProbeWindowMs = 2500;
+// Self-heal threshold: if the UART has been silent (zero RX bytes) for this
+// long since the most recent (re)start, reinstall the UART driver. Recovers
+// from the ESP32-S3 issue where usb_host_install (KH1-USBC / QMX paths)
+// clobbers the GPIO matrix routing for UART2 RX on the CAP-1262 (G15).
+constexpr uint32_t kSelfHealSilentMs = 20000;
+constexpr uint32_t kSelfHealCooldownMs = 20000;
 
 const char* kTag = "GPS";
 
 gps_state_t s_state = {};
+gps_pins_t s_pins = {};
 std::string s_line_buffer;
 uint32_t s_probe_start_ms = 0;
 uint32_t s_probe_rx_bytes = 0;
@@ -32,6 +36,20 @@ bool s_probe_decodable = false;
 int s_reported_good_baud = kGpsBaudFast;
 bool s_pending_baud_update = false;
 int s_pending_baud_value = 0;
+uint32_t s_last_self_heal_ms = 0;
+
+// Per-talker GSV bookkeeping. Multi-constellation receivers (the ATGM336H
+// emits GP/BD/GL) report sats-in-view separately per constellation, so we
+// keep the most recent count for each and sum only entries seen within
+// kGsvStaleMs to avoid double-counting after a talker goes silent.
+constexpr size_t kMaxGsvTalkers = 4;
+constexpr uint32_t kGsvStaleMs = 15000;
+struct gsv_talker_t {
+  char tag[3];        // "GP", "BD", "GL", "GA", "GN"; empty slot = tag[0]==0
+  int in_view;
+  uint32_t at_ms;
+};
+gsv_talker_t s_gsv[kMaxGsvTalkers] = {};
 
 inline uint32_t now_ms() {
   return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -113,6 +131,35 @@ void rearm_probe_window() {
   s_line_buffer.clear();
 }
 
+void reset_gsv_tracking() {
+  for (auto& t : s_gsv) { t.tag[0] = 0; t.in_view = 0; t.at_ms = 0; }
+  s_state.satellites_in_view = 0;
+}
+
+void update_gsv_talker(const std::string& tag, int in_view) {
+  if (tag.empty() || tag.size() > 2) return;
+  const uint32_t now = now_ms();
+  // Find existing slot for this tag, or the oldest slot to replace.
+  gsv_talker_t* victim = nullptr;
+  uint32_t oldest = UINT32_MAX;
+  for (auto& t : s_gsv) {
+    if (t.tag[0] != 0 && tag == t.tag) { victim = &t; break; }
+    if (t.tag[0] == 0) { victim = &t; break; }
+    if (t.at_ms < oldest) { oldest = t.at_ms; victim = &t; }
+  }
+  if (!victim) return;
+  std::strncpy(victim->tag, tag.c_str(), sizeof(victim->tag) - 1);
+  victim->tag[sizeof(victim->tag) - 1] = 0;
+  victim->in_view = in_view;
+  victim->at_ms = now;
+
+  int total = 0;
+  for (const auto& t : s_gsv) {
+    if (t.tag[0] != 0 && (now - t.at_ms) <= kGsvStaleMs) total += t.in_view;
+  }
+  s_state.satellites_in_view = total;
+}
+
 bool configure_uart(int baud) {
   uart_config_t cfg = {};
   cfg.baud_rate = normalize_baud(baud);
@@ -125,32 +172,62 @@ bool configure_uart(int baud) {
 #else
   cfg.source_clk = UART_SCLK_DEFAULT;
 #endif
-  esp_err_t err = uart_param_config(kGpsUartNum, &cfg);
+  esp_err_t err = uart_param_config(s_pins.uart, &cfg);
   if (err != ESP_OK) return false;
-  err = uart_set_pin(kGpsUartNum, kGpsTxPin, kGpsRxPin,
+  err = uart_set_pin(s_pins.uart, s_pins.tx, s_pins.rx,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   if (err != ESP_OK) return false;
-  err = uart_set_line_inverse(kGpsUartNum, (uart_signal_inv_t)0);
+  err = uart_set_line_inverse(s_pins.uart, (uart_signal_inv_t)0);
   if (err != ESP_OK) return false;
-  err = uart_set_baudrate(kGpsUartNum, normalize_baud(baud));
+  err = uart_set_baudrate(s_pins.uart, normalize_baud(baud));
   if (err != ESP_OK) return false;
-  uart_flush_input(kGpsUartNum);
+  uart_flush_input(s_pins.uart);
   return true;
 }
 
 bool ensure_uart_driver() {
-  esp_err_t err = uart_driver_install(kGpsUartNum, 2048, 0, 0, nullptr, 0);
+  esp_err_t err = uart_driver_install(s_pins.uart, 2048, 0, 0, nullptr, 0);
   if (err == ESP_ERR_INVALID_STATE) {
-    uart_driver_delete(kGpsUartNum);
-    err = uart_driver_install(kGpsUartNum, 2048, 0, 0, nullptr, 0);
+    uart_driver_delete(s_pins.uart);
+    err = uart_driver_install(s_pins.uart, 2048, 0, 0, nullptr, 0);
   }
   return err == ESP_OK;
 }
 
+void try_self_heal_uart() {
+  if (!s_state.running) return;
+  if (s_state.total_rx_bytes > 0) return;  // bytes flowing — nothing to heal
+  const uint32_t now = now_ms();
+  const uint32_t uptime = now - s_state.started_at_ms;
+  if (uptime < kSelfHealSilentMs) return;
+  if (s_last_self_heal_ms != 0 && (now - s_last_self_heal_ms) < kSelfHealCooldownMs) return;
+  s_last_self_heal_ms = now;
+
+  ESP_LOGW(kTag, "GPS self-heal: %ums silent on UART%d → reinstall driver",
+           (unsigned)uptime, (int)s_pins.uart);
+
+  // Reinstall the UART driver and re-mux the pins. configure_uart() calls
+  // uart_set_pin(), which rewrites the GPIO matrix — that's what we need
+  // to undo whatever clobbered the routing.
+  const int baud = s_state.active_baud;
+  uart_driver_delete(s_pins.uart);
+  if (!ensure_uart_driver()) {
+    ESP_LOGW(kTag, "GPS self-heal: driver install failed");
+    return;
+  }
+  if (!configure_uart(baud)) {
+    ESP_LOGW(kTag, "GPS self-heal: UART config failed");
+    uart_driver_delete(s_pins.uart);
+    s_state.running = false;
+    return;
+  }
+  s_state.started_at_ms = now;
+}
+
 void switch_baud_internal(int baud) {
   baud = normalize_baud(baud);
-  if (uart_set_baudrate(kGpsUartNum, baud) != ESP_OK) return;
-  uart_flush_input(kGpsUartNum);
+  if (uart_set_baudrate(s_pins.uart, baud) != ESP_OK) return;
+  uart_flush_input(s_pins.uart);
   s_state.active_baud = baud;
   s_state.baud_locked = false;
   rearm_probe_window();
@@ -195,7 +272,12 @@ bool parse_sentence(const std::string& raw_line) {
     }
   } else if (type.size() >= 3 && type.compare(type.size() - 3, 3, "GGA") == 0 && parts.size() >= 8) {
     recognized = true;
+    if (!parts[6].empty()) s_state.gga_fix_quality = std::atoi(parts[6].c_str());
     if (!parts[7].empty()) s_state.satellites = std::atoi(parts[7].c_str());
+  } else if (type.size() >= 3 && type.compare(type.size() - 3, 3, "GSV") == 0 && parts.size() >= 4) {
+    recognized = true;
+    const int in_view = std::atoi(parts[3].c_str());
+    update_gsv_talker(type.substr(0, type.size() - 3), in_view);
   }
 
   s_state.last_rx_ms = now_ms();
@@ -208,6 +290,7 @@ bool parse_sentence(const std::string& raw_line) {
 void ingest_uart_bytes(const uint8_t* data, int len) {
   if (len <= 0) return;
   s_probe_rx_bytes += (uint32_t)len;
+  s_state.total_rx_bytes += (uint32_t)len;
   for (int i = 0; i < len; ++i) {
     char c = (char)data[i];
     if (c == '\r' || c == '\n') {
@@ -225,9 +308,11 @@ void ingest_uart_bytes(const uint8_t* data, int len) {
 
 }  // namespace
 
-void gps_start(int preload_baud) {
-  preload_baud = normalize_baud(preload_baud);
+void gps_start(const gps_pins_t& pins) {
   if (s_state.running) return;
+
+  s_pins = pins;
+  const int preload_baud = normalize_baud(s_pins.default_baud);
 
   if (!ensure_uart_driver()) {
     ESP_LOGW(kTag, "GPS UART driver install failed");
@@ -235,7 +320,7 @@ void gps_start(int preload_baud) {
   }
   if (!configure_uart(preload_baud)) {
     ESP_LOGW(kTag, "GPS UART config failed");
-    uart_driver_delete(kGpsUartNum);
+    uart_driver_delete(s_pins.uart);
     return;
   }
 
@@ -243,18 +328,22 @@ void gps_start(int preload_baud) {
   s_state.running = true;
   s_state.active_baud = preload_baud;
   s_state.baud_locked = false;
+  s_state.started_at_ms = now_ms();
   s_reported_good_baud = preload_baud;
   s_pending_baud_update = false;
   s_pending_baud_value = 0;
+  s_last_self_heal_ms = 0;
+  reset_gsv_tracking();
   rearm_probe_window();
-  ESP_LOGI(kTag, "GPS started on UART%d TX=G%d RX=G%d preload=%d",
-           (int)kGpsUartNum, (int)kGpsTxPin, (int)kGpsRxPin, preload_baud);
+  ESP_LOGI(kTag, "GPS started on UART%d TX=G%d RX=G%d preload=%d auto=%d",
+           (int)s_pins.uart, (int)s_pins.tx, (int)s_pins.rx, preload_baud,
+           s_pins.auto_baud ? 1 : 0);
 }
 
 void gps_stop() {
   if (!s_state.running) return;
-  uart_flush_input(kGpsUartNum);
-  uart_driver_delete(kGpsUartNum);
+  uart_flush_input(s_pins.uart);
+  uart_driver_delete(s_pins.uart);
   s_state = {};
   s_pending_baud_update = false;
   s_pending_baud_value = 0;
@@ -262,6 +351,7 @@ void gps_stop() {
   s_probe_start_ms = 0;
   s_probe_rx_bytes = 0;
   s_probe_decodable = false;
+  reset_gsv_tracking();
   ESP_LOGI(kTag, "GPS stopped");
 }
 
@@ -269,10 +359,10 @@ void gps_tick() {
   if (!s_state.running) return;
 
   uint8_t buf[256];
-  int len = uart_read_bytes(kGpsUartNum, buf, sizeof(buf), 0);
+  int len = uart_read_bytes(s_pins.uart, buf, sizeof(buf), 0);
   if (len > 0) ingest_uart_bytes(buf, len);
 
-  if (!s_state.baud_locked) {
+  if (s_pins.auto_baud && !s_state.baud_locked) {
     uint32_t now = now_ms();
     if (s_probe_rx_bytes > 0 &&
         (now - s_probe_start_ms) >= kProbeWindowMs &&
@@ -280,6 +370,8 @@ void gps_tick() {
       switch_baud_internal(other_baud(s_state.active_baud));
     }
   }
+
+  try_self_heal_uart();
 }
 
 gps_state_t gps_get_state() {

@@ -91,7 +91,8 @@ Notes:
 | `T` (TX Queue) | `1` | Rotate the queue to the next same-parity entry. |
 |  | `2..6` | Drop the queue item on the current page. |
 |  | `` ` `` | Cancel TX immediately. |
-| `G` (GPS) |  | View live GPS telemetry including 3D fix, satellites, UTC time, grid square, and last synchronization age. |
+| `G` (GPS) |  | View live GPS telemetry including 3D fix, satellites, UTC time, grid square, and last synchronization age. The first line shows the active source. |
+|  | `1` | Cycle GPS source: PORTA (Grove AT6668) → CAP (LoRa-1262 stacking cap on G15/G13) → Off. Persists across reboots. |
 | `S` (STATUS) | `1` | Cycle Beacon mode. Applies when leaving STATUS mode. |
 |  | `2` | Run connect/sync now; starts audio and follows the CAT sync path. |
 |  | `3` | Step to the next active band. Applies after key 2 is pressed or when leaving STATUS. |
@@ -142,7 +143,20 @@ Notes:
 
 ## GPS Connections
 
-Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure the micro swithch is on the left.** Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
+Two GPS sources are supported, selectable from the GPS view (`G`, press `1` to cycle). The chosen source is persisted in `Station.txt` (`gps_source=`).
+
+- **PORTA** (default): any NMEA UART module wired to the Grove PORTA. Both 9600 and 115200 baud are supported (auto-detected). **Make sure the micro switch is on the left.** Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
+- **CAP**: the M5Stack [Cap LoRa-1262](https://docs.m5stack.com/en/cap/Cap_LoRa-1262) stacking cap (ATGM336H GNSS). No wiring needed — it plugs onto the Cardputer ADV's top header. Fixed 115200 baud, lives on UART2/G15/G13, so it coexists with KH1 CAT (which uses UART1/G1/G2). The LoRa side is not used by this firmware.
+
+While waiting for a fix, the GPS view shows a diagnostic line `NoFix Q:N V:N` followed by `Up:Ns Rx:NkB L:N`:
+
+- **Q** — fix quality reported by the chip (0 = no fix, 1 = GPS, 2 = DGPS).
+- **V** — satellites visible across all constellations (from GSV).
+- **Up** — seconds since GPS started; cold start is typically 30–60 s with sky view, 5+ min near a window.
+- **Rx / L** — bytes received and parser lock (both should climb; `L1` means NMEA is being decoded).
+
+If `V` stays at 0 even outside, the antenna isn't hearing satellites — most often a sky-view problem, especially with the CAP's small patch antenna.
+
 ```text
 ┌──────────────────┐                 ┌─────────────────────────────┐
 │ GPS              │                 │ Cardputer ADV               │
