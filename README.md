@@ -1,8 +1,7 @@
 Subscribe to [https://freelists.org/list/qrp-portable](https://freelists.org/list/qrp-portable) for announcements, discussions, and updates about my Mini-series apps for the Cardputer ADV.
 
-Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
-
-### Dean, KD3AN had added support for IC705: (https://github.com/hamrec/cp705)
+### Dean, KD3AN had added support for IC705: https://github.com/hamrec/cp705
+### Michael, 2E0MIK had added support for FTX-1: https://github.com/mapoby/Mini-FT8
 
 # First POTA activation (v1.0 2025-12-31)
 ![First POTA Activation](IMG_6087.jpeg)
