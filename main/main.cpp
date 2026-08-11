@@ -1212,10 +1212,27 @@ static void ensure_usb() {
 }
 
 static bool uart_inject_last_was_cr = false;
-static bool g_debug_uart_pins_enabled = true;
+static bool g_debug_uart_pins_enabled = false;
+static int64_t s_uart_inject_mute_until_ms = 0;
+
+static void drain_console_uart_rx_fifo() {
+  uart_dev_t *hw = UART_LL_GET_HW(0);
+  uint8_t scratch[64];
+  while (uart_ll_get_rxfifo_len(hw) > 0) {
+    uint32_t n = uart_ll_get_rxfifo_len(hw);
+    if (n > sizeof(scratch)) n = sizeof(scratch);
+    uart_ll_read_rxfifo(hw, scratch, n);
+  }
+  if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
+  uart_inject_last_was_cr = false;
+}
 
 static void poll_uart_inject_keys() {
   if (!s_key_inject_queue || !g_debug_uart_pins_enabled) return;
+  if ((esp_timer_get_time() / 1000) < s_uart_inject_mute_until_ms) {
+    drain_console_uart_rx_fifo();
+    return;
+  }
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
   // pins TX=G4, RX=G5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
@@ -1327,12 +1344,14 @@ static void apply_debug_uart_pin_policy() {
   const gpio_num_t rx = (gpio_num_t)CONFIG_ESP_CONSOLE_UART_RX_GPIO;
   if (enable) {
     uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_inject_last_was_cr = false;
+    gpio_set_pull_mode(rx, GPIO_PULLUP_ONLY);
+    drain_console_uart_rx_fifo();
+    s_uart_inject_mute_until_ms = esp_timer_get_time() / 1000 + 300;
     g_debug_uart_pins_enabled = true;
     ESP_LOGI(TAG, "G4/G5 debug UART enabled");
   } else {
-    if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
-    uart_inject_last_was_cr = false;
+    drain_console_uart_rx_fifo();
+    s_uart_inject_mute_until_ms = esp_timer_get_time() / 1000 + 300;
 #if UART_SCREEN_MIRROR
     g_uart_mirror_pending = false;
 #endif
@@ -1996,6 +2015,27 @@ void rebuild_ignore_prefixes() {
   }
 }
 
+void sync_ignore_prefix_text_from_list() {
+  std::vector<std::string> normalized;
+  for (const auto& prefix : g_ignore_prefixes) {
+    std::string norm = normalize_call_token(prefix);
+    if (norm.empty()) continue;
+    if (std::find(normalized.begin(), normalized.end(), norm) == normalized.end()) {
+      normalized.push_back(norm);
+    }
+  }
+
+  std::string text;
+  for (const auto& prefix : normalized) {
+    const size_t needed = text.size() + (text.empty() ? 0 : 1) + prefix.size();
+    if (needed > kIgnorePrefixTextMaxLen) break;
+    if (!text.empty()) text.push_back(' ');
+    text += prefix;
+  }
+  g_ignore_prefix_text = text;
+  rebuild_ignore_prefixes();
+}
+
 static bool ignorelist_matches_normalized_dxcall(const std::string& dxcall_norm) {
   if (dxcall_norm.empty()) return false;
   for (const auto& prefix : g_ignore_prefixes) {
@@ -2135,6 +2175,16 @@ std::string grid_ft8_4(const std::string& grid) {
   const std::string norm = normalize_grid_maidenhead(grid);
   if (norm.size() >= 4) return norm.substr(0, 4);
   return "CM97";
+}
+
+bool set_manual_grid_config(const std::string& grid) {
+  const std::string norm_grid = normalize_grid_maidenhead(grid);
+  if (norm_grid.empty()) return false;
+  g_grid = norm_grid;
+  g_grid_saved_manual = g_grid;
+  g_grid_from_gps = false;
+  g_grid_gps_display8.clear();
+  return true;
 }
 
 static std::string menu_sleep_batt_line() {
@@ -3507,8 +3557,8 @@ static void draw_menu_view() {
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
-  lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
-  lines.push_back(std::string("GNSS_LoRa:") + (g_gnss_lora_enabled ? "ON" : "OFF"));
+  lines.push_back(std::string("Bands:") + head_trim(g_active_band_text, 11));
+  lines.push_back(std::string("LoRa GPS:") + (g_gnss_lora_enabled ? "ON" : "OFF"));
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
@@ -4682,15 +4732,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   // Drain any stale bytes left in the FIFO from ROM-bootloader time
   // (when UART0 RX was still on its IO_MUX default pin, likely floating).
-  {
-    uart_dev_t *hw = UART_LL_GET_HW(0);
-    uint8_t scratch[64];
-    while (uart_ll_get_rxfifo_len(hw) > 0) {
-      uint32_t n = uart_ll_get_rxfifo_len(hw);
-      if (n > 64) n = 64;
-      uart_ll_read_rxfifo(hw, scratch, n);
-    }
-  }
+  drain_console_uart_rx_fifo();
   apply_debug_uart_pin_policy();
 
   // UI loop

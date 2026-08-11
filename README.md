@@ -39,7 +39,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `G` | GPS | View GPS telemetry and synchronization status. |
 | `M` | MENU P1 | Configure core station and operator settings. |
 | `N` | MENU P2 | Configure radio, input, and comment settings. |
-| `O` | MENU P3 | Configure logging, active bands, GNSS LoRa GPS, copy-to-SD, and retry settings. |
+| `O` | MENU P3 | Configure logging, bands, LoRa GPS, copy-to-SD, and retry settings. |
 | `Q` | QSO | Browse QSO and log files, and view entries. |
 | `D` | Delete Files | Browse and delete files stored in internal FATFS. |
 | `B` | BAND | Edit per-band frequencies. |
@@ -89,7 +89,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `O` (MENU P3) | `1` | Turn RxTx log on/off. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. |
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
-|  | `4` | Toggle `GNSS_LoRa`. `OFF` uses PORTA GPS; `ON` uses the LoRa-1262 cap GNSS. |
+|  | `4` | Toggle `LoRa GPS`. `OFF` uses PORTA GPS; `ON` uses the LoRa-1262 cap GPS. |
 |  | `5` | Copy files to SD. Feedback is `Copied OK` or `Missed [n]`. |
 |  | `6` | Edit max retry (in place). Accepts any natural number or `0`. |
 | `Q` (QSO) | `1..6` | Open the selected ADIF file. |

@@ -51,7 +51,9 @@ void apply_radio_profile_binding();
 void update_autoseq_cq_type();
 void rebuild_active_bands();
 void rebuild_ignore_prefixes();
+void sync_ignore_prefix_text_from_list();
 bool rtc_apply_manual_time_from_strings();
+bool set_manual_grid_config(const std::string& grid);
 
 // Access to ui.cpp (RX list live in ui.cpp's static array).
 int  ui_get_rx_count();
@@ -492,7 +494,14 @@ bool core_cmd_set_call(const std::string& call) {
   return true;
 }
 bool core_cmd_set_grid(const std::string& grid) {
-  if (!apply_config_write([&]{ g_grid = grid; })) return false;
+  bool ok = false;
+  {
+    ConfigGuard g;
+    ok = set_manual_grid_config(grid);
+  }
+  if (!ok) return false;
+  g_config_save_pending = true;
+  core_fire_config_changed();
   autoseq_set_station(g_call, grid_ft8_4(g_grid));
   return true;
 }
@@ -590,8 +599,8 @@ bool core_cmd_ignore_add(const std::string& prefix) {
       if (p == prefix) return true;  // already present
     }
     g_ignore_prefixes.push_back(prefix);
+    sync_ignore_prefix_text_from_list();
   }
-  rebuild_ignore_prefixes();
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
@@ -603,9 +612,9 @@ bool core_cmd_ignore_remove(const std::string& prefix) {
     for (auto it = g_ignore_prefixes.begin(); it != g_ignore_prefixes.end(); ++it) {
       if (*it == prefix) { g_ignore_prefixes.erase(it); removed = true; break; }
     }
+    if (removed) sync_ignore_prefix_text_from_list();
   }
   if (!removed) return false;
-  rebuild_ignore_prefixes();
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
@@ -614,8 +623,8 @@ bool core_cmd_ignore_clear() {
   {
     ConfigGuard g;
     g_ignore_prefixes.clear();
+    sync_ignore_prefix_text_from_list();
   }
-  rebuild_ignore_prefixes();
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;

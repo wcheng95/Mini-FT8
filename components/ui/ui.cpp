@@ -22,6 +22,16 @@ static RxDecodeEntry rx_lines[RX_MAX_DECODES];
 static int rx_lines_count = 0;
 static int rx_page = 0;
 static int rx_selected = -1;  // global index into rx_lines
+
+static std::string fit_text_width(std::string text, int max_width) {
+    if (M5.Display.textWidth(text.c_str()) <= max_width) return text;
+    while (!text.empty() && M5.Display.textWidth((text + ">").c_str()) > max_width) {
+        text.pop_back();
+    }
+    if (!text.empty()) text.push_back('>');
+    return text;
+}
+
 struct RxDrawCacheEntry {
     char text[RX_TEXT_MAX];
     bool is_cq;
@@ -439,8 +449,9 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
         if (idx < (int)lines.size()) {
             M5.Display.setTextColor(TFT_WHITE, bg);
             M5.Display.setCursor(0, y);
-            M5.Display.printf("%d %s", i + 1, lines[idx].c_str());
-            g_visible_rows[i] = std::to_string(i + 1) + " " + lines[idx];
+            std::string row = fit_text_width(std::to_string(i + 1) + " " + lines[idx], SCREEN_W);
+            M5.Display.print(row.c_str());
+            g_visible_rows[i] = row;
         } else {
             g_visible_rows[i].clear();
         }

@@ -1062,6 +1062,16 @@ bool storage_sync_station_from_sd() {
     }
     s_station_sync_attempted = true;
 
+    std::string internal_path;
+    struct stat st = {};
+    if (build_path(kStationFile, internal_path) &&
+        stat(internal_path.c_str(), &st) == 0 &&
+        S_ISREG(st.st_mode) &&
+        st.st_size > 0) {
+        ESP_LOGI(TAG, "Internal Station.txt exists; skipping SD import");
+        return true;
+    }
+
     if (mount_sd_locked() != ESP_OK) {
         ESP_LOGI(TAG, "SD not mounted; using internal Station.txt");
         return false;
