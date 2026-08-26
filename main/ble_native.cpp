@@ -97,6 +97,10 @@ struct WaterfallSlot {
 };
 static WaterfallSlot s_wf_slot;
 
+// Most day-logs returned by one adif_list. Bounded by the 256-byte RPC
+// response, not by storage — "n" in the response carries the true total.
+static constexpr int kAdifListMax = 10;
+
 // ADIF streaming state
 struct AdifStreamState {
   volatile bool active   = false;
@@ -715,16 +719,44 @@ RpcResult dispatch_rpc(const std::string& cmd, cJSON* args) {
   if (cmd == BLE_NATIVE_RPC_IGNORE_CLEAR) {
     return core_cmd_ignore_clear() ? res_ok() : res_err("ignore_clear");
   }
+  if (cmd == BLE_NATIVE_RPC_ADIF_LIST) {
+    // Newest-first day-logs with sizes, so the client can diff against its
+    // own cursors and fetch only what changed. The whole response has to fit
+    // kRpcJsonMax (256 B) including the {"id":N,"ok":true...} envelope, so
+    // cap the array and report the true total separately in "n".
+    CoreAdifFileInfo files[kAdifListMax];
+    int total = core_adif_list(files, kAdifListMax);
+    int shown = total < kAdifListMax ? total : kAdifListMax;
+
+    // Budget: envelope is at most ~22 B, closing brace 1, NUL 1. Stop early
+    // if an entry would not fit rather than emitting truncated JSON.
+    constexpr size_t kExtraBudget = kRpcJsonMax - 32;
+    std::string extra = ",\"n\":" + std::to_string(total) + ",\"f\":[";
+    for (int i = 0; i < shown; ++i) {
+      char item[32];
+      snprintf(item, sizeof(item), "%s\"%s:%d\"",
+               i ? "," : "", files[i].date, files[i].size);
+      if (extra.size() + strlen(item) + 1 > kExtraBudget) break;
+      extra += item;
+    }
+    extra += "]";
+    return res_ok_extra(std::move(extra));
+  }
   if (cmd == BLE_NATIVE_RPC_ADIF_OPEN) {
     if (s_adif.active) return res_err("adif busy");
-    CoreAdifHandle h = core_adif_open();
+    // Both args optional: "d" defaults to today, "off" to 0. A non-zero
+    // offset resumes an interrupted or incremental download — day-logs are
+    // append-only, so bytes before the cursor can never have changed.
+    const std::string date = arg_str(args, "d");
+    const int         off  = arg_int(args, "off", 0);
+    CoreAdifHandle h = core_adif_open(date.empty() ? nullptr : date.c_str(), off);
     if (h.id < 0) return res_err("adif open failed");
     s_adif.handle   = h.id;
     s_adif.total    = h.total;
     s_adif.eof_sent = false;
     s_adif.active   = true;
-    char extra[32];
-    snprintf(extra, sizeof(extra), ",\"size\":%d", h.total);
+    char extra[48];
+    snprintf(extra, sizeof(extra), ",\"size\":%d,\"off\":%d", h.total, h.offset);
     return res_ok_extra(extra);
   }
   if (cmd == BLE_NATIVE_RPC_ADIF_CLOSE) {

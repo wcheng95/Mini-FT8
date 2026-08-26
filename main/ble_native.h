@@ -22,7 +22,7 @@
 // ---------------------------------------------------------------------------
 // Protocol version — bump major on wire-incompatible change.
 // ---------------------------------------------------------------------------
-#define BLE_NATIVE_VERSION "1.0.0"
+#define BLE_NATIVE_VERSION "1.1.0"
 
 // ---------------------------------------------------------------------------
 // UUIDs
@@ -97,7 +97,15 @@
 #define BLE_NATIVE_RPC_IGNORE_ADD      "ignore_add"
 #define BLE_NATIVE_RPC_IGNORE_REMOVE   "ignore_remove"
 #define BLE_NATIVE_RPC_IGNORE_CLEAR    "ignore_clear"
-#define BLE_NATIVE_RPC_ADIF_OPEN       "adif_open"    // response includes {"size":N}
+// adif_list  -> {"n":<total days>,"f":["YYYYMMDD:<bytes>",...]}  newest first.
+//               "f" is capped (see kAdifListMax in ble_native.cpp) to fit the
+//               256-byte RPC response; "n" is the true count, so a client can
+//               tell the list was truncated.
+// adif_open   args {"d":"YYYYMMDD","off":N} — both optional. "d" defaults to
+//               today, "off" to 0. Response includes {"size":N,"off":M} where
+//               size is the whole file and off is where streaming starts.
+#define BLE_NATIVE_RPC_ADIF_LIST       "adif_list"
+#define BLE_NATIVE_RPC_ADIF_OPEN       "adif_open"    // response {"size":N,"off":M}
 #define BLE_NATIVE_RPC_ADIF_CLOSE      "adif_close"
 
 // ---------------------------------------------------------------------------
@@ -145,6 +153,12 @@ static_assert(sizeof(BleRadioStreamHeader) == BLE_NATIVE_RADIO_STREAM_HEADER_SIZ
 // Each indication carries raw ADIF file bytes. A zero-length indication
 // marks end-of-file. Client must be subscribed; open/close happens via
 // RPC (adif_open / adif_close). Chunk size = MTU - 3.
+//
+// Logs are one file per UTC day ("/storage/YYYYMMDD.txt"), append-only while
+// the day is current and immutable after. So (date, byte offset) is a stable
+// resume cursor: adif_open {"d":...,"off":N} streams only the bytes appended
+// past N, which is what makes incremental sync cheap over BLE. Offsets must
+// land on a record boundary ("<eor>\n"); the firmware does not check.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

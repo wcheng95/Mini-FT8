@@ -15,6 +15,11 @@
 #include "autoseq.h"
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -637,37 +642,102 @@ AdifSession g_adif;
 int         g_adif_next_id = 1;
 }  // namespace
 
-CoreAdifHandle core_adif_open() {
-  CoreAdifHandle h{-1, -1};
-  if (g_adif.fp) return h;  // single-reader invariant
+// Day-log filenames are exactly "YYYYMMDD.txt" — same predicate the
+// Cardputer QSO viewer uses (is_daily_qso_txt_file in main.cpp). Anything
+// else in /storage (Station.txt, Cabrillo files) is not a day log.
+static bool adif_is_day_log(const char* name) {
+  if (!name) return false;
+  if (strlen(name) != 12) return false;
+  for (int i = 0; i < 8; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
+  }
+  return std::strcmp(name + 8, ".txt") == 0;
+}
 
-  // Find most recent .adi file in /storage.
-  // For simplicity, we just try today's filename; step 3 can add the
-  // full "pick most recent from listing" logic.
-  // Build "/storage/YYYYMMDD.adi" from g_date.
-  char path[64];
+// Today's date as YYYYMMDD, derived from g_date ("YYYY-MM-DD").
+static void adif_today(char out[9]) {
   const char* d = g_date.c_str();
-  // strip dashes
-  char yyyymmdd[9] = {0};
   int o = 0;
   for (int i = 0; d[i] && o < 8; ++i) {
-    if (d[i] >= '0' && d[i] <= '9') yyyymmdd[o++] = d[i];
+    if (d[i] >= '0' && d[i] <= '9') out[o++] = d[i];
   }
-  snprintf(path, sizeof(path), "/storage/%s.adi", yyyymmdd);
+  out[o] = '\0';
+}
+
+int core_adif_list(CoreAdifFileInfo* out, int max_out) {
+  DIR* dir = opendir("/storage");
+  if (!dir) return 0;
+
+  // Collect names first, sort newest-first, then stat only what we return.
+  // Lexicographic order on YYYYMMDD is chronological order.
+  std::vector<std::string> names;
+  struct dirent* ent;
+  while ((ent = readdir(dir)) != nullptr) {
+    if (adif_is_day_log(ent->d_name)) names.emplace_back(ent->d_name);
+  }
+  closedir(dir);
+
+  std::sort(names.begin(), names.end(), std::greater<std::string>());
+
+  const int total = (int)names.size();
+  if (!out || max_out <= 0) return total;
+
+  int n = 0;
+  for (int i = 0; i < total && n < max_out; ++i) {
+    std::string path = "/storage/" + names[i];
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) continue;   // vanished mid-listing
+    memcpy(out[n].date, names[i].c_str(), 8);
+    out[n].date[8] = '\0';
+    out[n].size    = (int)st.st_size;
+    ++n;
+  }
+  return total;
+}
+
+CoreAdifHandle core_adif_open(const char* yyyymmdd, int offset) {
+  CoreAdifHandle h{-1, -1, 0};
+  if (g_adif.fp) return h;  // single-reader invariant
+  if (offset < 0) return h;
+
+  char today[9];
+  char date[9];
+  if (yyyymmdd && yyyymmdd[0]) {
+    // Copy defensively — this comes off the wire.
+    size_t n = strnlen(yyyymmdd, 8);
+    if (n != 8) return h;
+    for (size_t i = 0; i < 8; ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(yyyymmdd[i]))) return h;
+    }
+    memcpy(date, yyyymmdd, 8);
+    date[8] = '\0';
+  } else {
+    adif_today(today);
+    memcpy(date, today, sizeof(today));
+  }
+
+  // Writer is log_adif_entry() in main.cpp, which uses ".txt". This must
+  // match it exactly — they disagreed until 2026-08, which made every
+  // adif_open fail with "adif open failed".
+  char path[64];
+  snprintf(path, sizeof(path), "/storage/%s.txt", date);
 
   FILE* f = fopen(path, "rb");
   if (!f) return h;
 
   fseek(f, 0, SEEK_END);
   long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
+
+  if (offset > size) { fclose(f); return h; }   // cursor past EOF
+  fseek(f, offset, SEEK_SET);
 
   g_adif.id    = g_adif_next_id++;
   g_adif.fp    = f;
   g_adif.total = size;
 
-  h.id    = g_adif.id;
-  h.total = (int)size;
+  h.id     = g_adif.id;
+  h.total  = (int)size;
+  h.offset = offset;
   return h;
 }
 

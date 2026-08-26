@@ -183,6 +183,42 @@ tightly enough designed to be worth documenting here.
 | `RPC_RESP` | S→C | notify | Per-request response (JSON) |
 | `ADIF_STREAM` | S→C | indicate | Chunked reliable log download |
 
+### Worked-QSO log download
+
+Logs live one file per UTC day at `/storage/YYYYMMDD.txt`, written by
+`log_adif_entry()`. A day's file is append-only while that day is current
+and immutable once it's past, which is what makes `(date, byte offset)` a
+durable resume cursor.
+
+| RPC | Args | Response |
+|---|---|---|
+| `adif_list` | — | `{"n":<total days>,"f":["YYYYMMDD:<bytes>",…]}` newest first |
+| `adif_open` | `{"d":"YYYYMMDD","off":N}` (both optional) | `{"size":N,"off":M}` |
+| `adif_close` | — | — |
+
+`adif_open` seeks to `off` and streams the rest over `ADIF_STREAM`;
+zero-length indication is EOF. Passing the byte count the client already
+holds for that day means only newly appended records cross the link, so a
+routine sync costs one open per day plus whatever was actually logged.
+
+`f` is capped (`kAdifListMax`, currently 10) so the response fits the
+256-byte RPC buffer; `n` is the true count, so a client can tell it was
+truncated rather than silently under-reporting the log.
+
+Offsets must land on a record boundary — records end `<eor>`. The firmware
+does not validate this; a client that tracks "bytes through the last
+complete `<eor>`" is always correct, and one that doesn't gets a partial
+leading record its parser drops.
+
+Two ordering constraints, both load-bearing:
+
+- **Subscribe to `ADIF_STREAM` before `adif_open`.** The firmware only
+  pumps chunks while a subscriber exists and starts pumping as soon as the
+  RPC returns.
+- **One reader at a time.** `core_adif_open()` holds a single `FILE*`;
+  a second open answers `adif busy` until the first closes or the link
+  drops.
+
 ### Why 8 characteristics, not one
 
 We could multiplex everything through one characteristic with a type

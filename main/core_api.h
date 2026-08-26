@@ -228,17 +228,42 @@ bool core_cmd_save_config();   // persist to flash (most setters do this auto)
 // ---------------------------------------------------------------------------
 // ADIF bulk stream
 //
-// Handle-based streaming read of the latest ADIF file. Caller polls
-// core_adif_read() repeatedly; returns empty vector when EOF reached.
+// Handle-based streaming read of a day's ADIF log. Caller polls
+// core_adif_read() repeatedly; returns false when EOF reached.
 // Multiple concurrent readers are not supported (single-reader invariant).
+//
+// Logs are stored one file per UTC day, "/storage/YYYYMMDD.txt", written by
+// log_adif_entry() in main.cpp. A day's file is append-only while that day
+// is current and immutable thereafter, so (date, byte offset) is a stable
+// resume cursor: a client that has already read N bytes of a given day can
+// reopen at N and receive only what was appended since.
+//
+// The offset must land on a record boundary. Records end with "<eor>\n", so
+// a client that tracks "bytes up to and including the last complete <eor>"
+// always has a valid offset. The firmware does not validate this — a bogus
+// offset yields a partial first record, which the client's parser drops.
 // ---------------------------------------------------------------------------
 
 struct CoreAdifHandle {
   int  id;       // >= 0 on success, -1 on failure
   int  total;    // total file size in bytes, or -1 if unknown
+  int  offset;   // byte position this session starts at
 };
 
-CoreAdifHandle core_adif_open();
+// One day-log file. Enumerated newest-first by core_adif_list().
+struct CoreAdifFileInfo {
+  char date[9];  // "YYYYMMDD", NUL-terminated
+  int  size;     // bytes
+};
+
+// Fills up to `max_out` entries, newest date first. Returns the total number
+// of day-logs present, which may exceed `max_out` — the caller can detect
+// truncation by comparing the return value against max_out.
+int core_adif_list(CoreAdifFileInfo* out, int max_out);
+
+// `yyyymmdd` selects the day-log; nullptr or "" means today. `offset` is the
+// byte position to resume from (0 = whole file). Fails if offset is past EOF.
+CoreAdifHandle core_adif_open(const char* yyyymmdd = nullptr, int offset = 0);
 // Reads the next chunk. Fills `out` with up to `max_bytes` bytes.
 // Returns true while more data is expected; false when EOF or error.
 bool           core_adif_read(int handle, std::vector<uint8_t>& out,
