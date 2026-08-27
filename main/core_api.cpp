@@ -17,9 +17,14 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <strings.h>   // strncasecmp, for case-insensitive ADIF field names
 #include <sys/stat.h>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -629,23 +634,15 @@ bool core_cmd_save_config() {
 }
 
 // ---------------------------------------------------------------------------
-// ADIF streaming (handle-based, single-reader)
+// Worked-QSO log — the one ADIF reader (see core_api.h)
 // ---------------------------------------------------------------------------
 
 namespace {
-struct AdifSession {
-  int     id          = -1;
-  FILE*   fp          = nullptr;
-  long    total       = -1;
-};
-AdifSession g_adif;
-int         g_adif_next_id = 1;
-}  // namespace
 
-// Day-log filenames are exactly "YYYYMMDD.txt" — same predicate the
-// Cardputer QSO viewer uses (is_daily_qso_txt_file in main.cpp). Anything
-// else in /storage (Station.txt, Cabrillo files) is not a day log.
-static bool adif_is_day_log(const char* name) {
+// Day-log filenames are exactly "YYYYMMDD.txt", matching what
+// log_adif_entry() writes. Everything else in /storage (Station.txt,
+// Cabrillo files) is not a day log.
+bool log_is_day_file(const char* name) {
   if (!name) return false;
   if (strlen(name) != 12) return false;
   for (int i = 0; i < 8; ++i) {
@@ -654,29 +651,171 @@ static bool adif_is_day_log(const char* name) {
   return std::strcmp(name + 8, ".txt") == 0;
 }
 
-// Today's date as YYYYMMDD, derived from g_date ("YYYY-MM-DD").
-static void adif_today(char out[9]) {
-  const char* d = g_date.c_str();
-  int o = 0;
-  for (int i = 0; d[i] && o < 8; ++i) {
-    if (d[i] >= '0' && d[i] <= '9') out[o++] = d[i];
+// Builds "/storage/YYYYMMDD.txt". A null or empty date means today, taken
+// from g_date ("YYYY-MM-DD"). Returns false on a malformed date — this can
+// arrive off the wire, so it is validated rather than trusted.
+bool log_day_path(const char* yyyymmdd, char* out, size_t out_sz) {
+  char date[9];
+  if (yyyymmdd && yyyymmdd[0]) {
+    if (strnlen(yyyymmdd, 9) != 8) return false;
+    for (int i = 0; i < 8; ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(yyyymmdd[i]))) return false;
+    }
+    memcpy(date, yyyymmdd, 8);
+  } else {
+    const char* d = g_date.c_str();
+    int o = 0;
+    for (int i = 0; d[i] && o < 8; ++i) {
+      if (d[i] >= '0' && d[i] <= '9') date[o++] = d[i];
+    }
+    if (o != 8) return false;
   }
-  out[o] = '\0';
+  date[8] = '\0';
+  snprintf(out, out_sz, "/storage/%s.txt", date);
+  return true;
 }
 
-int core_adif_list(CoreAdifFileInfo* out, int max_out) {
+constexpr size_t kLogRecMax = 512;
+
+// Reads bytes up to and including the next "<eor>" (case-insensitive).
+// Returns false at EOF, which also discards any trailing partial record —
+// a half-written entry is not a record.
+//
+// Scanning for the terminator rather than reading lines means a record may
+// span newlines and an over-long one is truncated at kLogRecMax instead of
+// corrupting the records after it.
+bool log_next_record(FILE* f, char* rec, size_t* out_len) {
+  static const char kEor[] = "<eor>";
+  size_t n = 0;
+  int    m = 0;                       // chars of "<eor>" matched so far
+  int    c;
+  while ((c = fgetc(f)) != EOF) {
+    if (n + 1 < kLogRecMax) rec[n++] = (char)c;
+    const char lc = (char)std::tolower(static_cast<unsigned char>(c));
+    if (lc == kEor[m]) {
+      if (++m == 5) { rec[n] = '\0'; *out_len = n; return true; }
+    } else {
+      m = (lc == '<') ? 1 : 0;        // a fresh '<' restarts the match
+    }
+  }
+  rec[n] = '\0';
+  *out_len = n;
+  return false;
+}
+
+// Extracts one field by name. ADIF declares a byte count in the tag
+// ("<call:5>W1ABC"), so the length is authoritative and the value may
+// legally contain spaces, '<' or '>'. Scanning for a delimiter instead —
+// which the old Cardputer viewer did — truncates any value with a space in
+// it, and the default comment "MiniFT8 /Radio" has one.
+bool log_field(const char* rec, size_t len, const char* name,
+               char* out, size_t out_sz) {
+  out[0] = '\0';
+  const size_t nlen = strlen(name);
+  size_t i = 0;
+  while (i < len) {
+    const char* lt = (const char*)memchr(rec + i, '<', len - i);
+    if (!lt) return false;
+    const size_t p = (size_t)(lt - rec);
+    const char* gt = (const char*)memchr(rec + p, '>', len - p);
+    if (!gt) return false;
+    const size_t q = (size_t)(gt - rec);
+
+    // "<eor>" / "<eoh>" carry no length — skip them.
+    const char* colon = (const char*)memchr(rec + p + 1, ':', q - p - 1);
+    if (!colon) { i = q + 1; continue; }
+
+    const size_t fname_len = (size_t)(colon - (rec + p + 1));
+    int vlen = atoi(colon + 1);       // stops at ':' (type suffix) or '>'
+    if (vlen < 0) vlen = 0;
+    const size_t vstart = q + 1;
+    if (vstart + (size_t)vlen > len) return false;   // runs past the record
+
+    if (fname_len == nlen && strncasecmp(rec + p + 1, name, nlen) == 0) {
+      size_t n = (size_t)vlen;
+      if (n > out_sz - 1) n = out_sz - 1;            // truncate, don't drop
+      memcpy(out, rec + vstart, n);
+      out[n] = '\0';
+      return true;
+    }
+    i = vstart + (size_t)vlen;
+  }
+  return false;
+}
+
+bool log_record_has_call(const char* rec, size_t len) {
+  char buf[16];
+  return log_field(rec, len, "call", buf, sizeof(buf)) && buf[0] != '\0';
+}
+
+// Same crude ±0.1 MHz match the Cardputer viewer has always used. Falls back
+// to the raw frequency when it doesn't land in a configured band.
+void log_band_name(const char* freq, char* out, size_t out_sz) {
+  out[0] = '\0';
+  if (!freq || !freq[0]) return;
+  const double mhz = atof(freq);
+  for (const auto& b : g_bands) {
+    if (fabs(b.freq * 0.001 - mhz) < 0.1) {
+      snprintf(out, out_sz, "%s", b.name ? b.name : "");
+      return;
+    }
+  }
+  snprintf(out, out_sz, "%s", freq);
+}
+
+void log_fill_entry(const char* rec, size_t len, int index, CoreLogEntry& e) {
+  e = CoreLogEntry{};
+  e.index = index;
+
+  log_field(rec, len, "call",       e.call,    sizeof(e.call));
+  log_field(rec, len, "gridsquare", e.grid,    sizeof(e.grid));
+  log_field(rec, len, "mode",       e.mode,    sizeof(e.mode));
+  log_field(rec, len, "time_on",    e.time_on, sizeof(e.time_on));
+  log_field(rec, len, "freq",       e.freq,    sizeof(e.freq));
+  log_field(rec, len, "comment",    e.comment, sizeof(e.comment));
+  log_band_name(e.freq, e.band, sizeof(e.band));
+
+  char buf[16];
+  // Absent means the node had no report to log (it omits -99 rather than
+  // writing a number that would read as a real signal report).
+  e.has_rst_sent = log_field(rec, len, "rst_sent", buf, sizeof(buf)) && buf[0];
+  if (e.has_rst_sent) e.rst_sent = atoi(buf);
+  e.has_rst_rcvd = log_field(rec, len, "rst_rcvd", buf, sizeof(buf)) && buf[0];
+  if (e.has_rst_rcvd) e.rst_rcvd = atoi(buf);
+}
+
+}  // namespace
+
+int core_log_count(const char* yyyymmdd) {
+  char path[64];
+  if (!log_day_path(yyyymmdd, path, sizeof(path))) return -1;
+  FILE* f = fopen(path, "rb");
+  if (!f) return -1;
+
+  // Counts records carrying a call, which is what core_log_read indexes —
+  // the two must agree or paging drifts.
+  char   rec[kLogRecMax];
+  size_t len = 0;
+  int    n = 0;
+  while (log_next_record(f, rec, &len)) {
+    if (log_record_has_call(rec, len)) ++n;
+  }
+  fclose(f);
+  return n;
+}
+
+int core_log_list_days(CoreLogDay* out, int max_out) {
   DIR* dir = opendir("/storage");
   if (!dir) return 0;
 
-  // Collect names first, sort newest-first, then stat only what we return.
-  // Lexicographic order on YYYYMMDD is chronological order.
+  // Lexicographic order on YYYYMMDD is chronological, so a plain reverse
+  // sort gives newest-first.
   std::vector<std::string> names;
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
-    if (adif_is_day_log(ent->d_name)) names.emplace_back(ent->d_name);
+    if (log_is_day_file(ent->d_name)) names.emplace_back(ent->d_name);
   }
   closedir(dir);
-
   std::sort(names.begin(), names.end(), std::greater<std::string>());
 
   const int total = (int)names.size();
@@ -684,80 +823,37 @@ int core_adif_list(CoreAdifFileInfo* out, int max_out) {
 
   int n = 0;
   for (int i = 0; i < total && n < max_out; ++i) {
-    std::string path = "/storage/" + names[i];
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) continue;   // vanished mid-listing
-    memcpy(out[n].date, names[i].c_str(), 8);
-    out[n].date[8] = '\0';
-    out[n].size    = (int)st.st_size;
+    char date[9];
+    memcpy(date, names[i].c_str(), 8);
+    date[8] = '\0';
+    const int count = core_log_count(date);   // reads the file; days are small
+    if (count < 0) continue;                  // vanished mid-listing
+    memcpy(out[n].date, date, sizeof(date));
+    out[n].entries = count;
     ++n;
   }
   return total;
 }
 
-CoreAdifHandle core_adif_open(const char* yyyymmdd, int offset) {
-  CoreAdifHandle h{-1, -1, 0};
-  if (g_adif.fp) return h;  // single-reader invariant
-  if (offset < 0) return h;
+int core_log_read(const char* yyyymmdd, int from, int max_out,
+                  CoreLogEntry* out) {
+  if (!out || max_out <= 0) return 0;
+  if (from < 0) from = 0;
 
-  char today[9];
-  char date[9];
-  if (yyyymmdd && yyyymmdd[0]) {
-    // Copy defensively — this comes off the wire.
-    size_t n = strnlen(yyyymmdd, 8);
-    if (n != 8) return h;
-    for (size_t i = 0; i < 8; ++i) {
-      if (!std::isdigit(static_cast<unsigned char>(yyyymmdd[i]))) return h;
-    }
-    memcpy(date, yyyymmdd, 8);
-    date[8] = '\0';
-  } else {
-    adif_today(today);
-    memcpy(date, today, sizeof(today));
-  }
-
-  // Writer is log_adif_entry() in main.cpp, which uses ".txt". This must
-  // match it exactly — they disagreed until 2026-08, which made every
-  // adif_open fail with "adif open failed".
   char path[64];
-  snprintf(path, sizeof(path), "/storage/%s.txt", date);
-
+  if (!log_day_path(yyyymmdd, path, sizeof(path))) return -1;
   FILE* f = fopen(path, "rb");
-  if (!f) return h;
+  if (!f) return -1;
 
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-
-  if (offset > size) { fclose(f); return h; }   // cursor past EOF
-  fseek(f, offset, SEEK_SET);
-
-  g_adif.id    = g_adif_next_id++;
-  g_adif.fp    = f;
-  g_adif.total = size;
-
-  h.id     = g_adif.id;
-  h.total  = (int)size;
-  h.offset = offset;
-  return h;
-}
-
-bool core_adif_read(int handle, std::vector<uint8_t>& out, size_t max_bytes) {
-  out.clear();
-  if (handle != g_adif.id || !g_adif.fp) return false;
-  if (max_bytes == 0) max_bytes = 256;
-  out.resize(max_bytes);
-  size_t n = fread(out.data(), 1, max_bytes, g_adif.fp);
-  out.resize(n);
-  if (n == 0) {
-    // EOF or error — caller should close.
-    return false;
+  char   rec[kLogRecMax];
+  size_t len = 0;
+  int    index = 0;
+  int    n = 0;
+  while (n < max_out && log_next_record(f, rec, &len)) {
+    if (!log_record_has_call(rec, len)) continue;   // header, or junk
+    if (index >= from) log_fill_entry(rec, len, index, out[n++]);
+    ++index;
   }
-  return true;
-}
-
-void core_adif_close(int handle) {
-  if (handle != g_adif.id) return;
-  if (g_adif.fp) { fclose(g_adif.fp); g_adif.fp = nullptr; }
-  g_adif.id = -1;
-  g_adif.total = -1;
+  fclose(f);
+  return n;
 }

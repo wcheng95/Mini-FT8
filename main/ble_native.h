@@ -55,7 +55,7 @@
 #define BLE_NATIVE_CHR_RADIO_STREAM  BLE_NATIVE_UUID_SUFFIX(0x06)  // notify (binary)
 #define BLE_NATIVE_CHR_RPC_REQ       BLE_NATIVE_UUID_SUFFIX(0x07)  // write
 #define BLE_NATIVE_CHR_RPC_RESP      BLE_NATIVE_UUID_SUFFIX(0x08)  // notify
-#define BLE_NATIVE_CHR_ADIF_STREAM   BLE_NATIVE_UUID_SUFFIX(0x09)  // indicate (binary)
+#define BLE_NATIVE_CHR_LOG_STREAM    BLE_NATIVE_UUID_SUFFIX(0x09)  // indicate (JSON, one entry per packet)
 
 // ---------------------------------------------------------------------------
 // Event tags (in EVENTS notifications, JSON format).
@@ -97,16 +97,25 @@
 #define BLE_NATIVE_RPC_IGNORE_ADD      "ignore_add"
 #define BLE_NATIVE_RPC_IGNORE_REMOVE   "ignore_remove"
 #define BLE_NATIVE_RPC_IGNORE_CLEAR    "ignore_clear"
-// adif_list  -> {"n":<total days>,"f":["YYYYMMDD:<bytes>",...]}  newest first.
-//               "f" is capped (see kAdifListMax in ble_native.cpp) to fit the
-//               256-byte RPC response; "n" is the true count, so a client can
-//               tell the list was truncated.
-// adif_open   args {"d":"YYYYMMDD","off":N} — both optional. "d" defaults to
-//               today, "off" to 0. Response includes {"size":N,"off":M} where
-//               size is the whole file and off is where streaming starts.
-#define BLE_NATIVE_RPC_ADIF_LIST       "adif_list"
-#define BLE_NATIVE_RPC_ADIF_OPEN       "adif_open"    // response {"size":N,"off":M}
-#define BLE_NATIVE_RPC_ADIF_CLOSE      "adif_close"
+// Worked-QSO log. Access is per entry, not per byte: an ADIF record has a
+// schema and a bounded size, so it fits one indication and needs no
+// reassembly. The firmware owns the only ADIF parser (core_api.cpp) — clients
+// never see the file format.
+//
+// log_days -> {"n":<total days>,"d":["YYYYMMDD:<entries>",...]} newest first.
+//             "d" is capped (kLogDaysMax) to fit the 256-byte RPC response;
+//             "n" is the true count, so a client can tell it was truncated.
+// log_read   args {"d":"YYYYMMDD","from":N,"n":M} — all optional. "d"
+//             defaults to today, "from" to 0, "n" to "all remaining".
+//             Responds {"n":<will send>,"total":<entries that day>} then
+//             streams that many entries over LOG_STREAM.
+//             Entry indices are stable: the day file is append-only, so a
+//             client holding 0..N-1 asks for from=N and gets only what was
+//             logged since.
+// log_abort   stops an in-flight stream.
+#define BLE_NATIVE_RPC_LOG_DAYS        "log_days"
+#define BLE_NATIVE_RPC_LOG_READ        "log_read"
+#define BLE_NATIVE_RPC_LOG_ABORT       "log_abort"
 
 // ---------------------------------------------------------------------------
 // RADIO_STREAM packet (binary, little-endian).
@@ -148,19 +157,21 @@ static_assert(sizeof(BleRadioStreamHeader) == BLE_NATIVE_RADIO_STREAM_HEADER_SIZ
               "BleRadioStreamHeader packed size mismatch");
 
 // ---------------------------------------------------------------------------
-// ADIF_STREAM packet (binary, indicate-mode, reliable).
+// LOG_STREAM packet (JSON, indicate-mode, reliable).
 //
-// Each indication carries raw ADIF file bytes. A zero-length indication
-// marks end-of-file. Client must be subscribed; open/close happens via
-// RPC (adif_open / adif_close). Chunk size = MTU - 3.
+// One worked-QSO entry per indication, so each packet is self-contained and
+// well inside MTU — no chunk index, no reassembly. A zero-length indication
+// ends the stream. Client must be subscribed before issuing log_read; the
+// firmware only pumps while a subscriber exists.
 //
-// Logs are one file per UTC day ("/storage/YYYYMMDD.txt"), append-only while
-// the day is current and immutable after. So (date, byte offset) is a stable
-// resume cursor: adif_open {"d":...,"off":N} streams only the bytes appended
-// past N, which is what makes incremental sync cheap over BLE. Offsets must
-// land on a record boundary ("<eor>\n"); the firmware does not check.
-// ---------------------------------------------------------------------------
-
+//   {"i":0,"t":"142530","c":"W1ABC","g":"FN42","m":"FT8",
+//    "f":"14.074","b":"20m","s":-12,"r":-8,"x":"MiniFT8 /Radio"}
+//
+//   i index within the day   t time_on HHMMSS UTC   c call     g grid
+//   m mode                   f freq MHz            b band      x comment
+//   s rst_sent   r rst_rcvd  — both omitted when the node logged no report,
+//                              keeping "absent" distinct from a real 0 dB.
+//
 // ---------------------------------------------------------------------------
 // Initialization API (firmware only — Flutter clients don't need this).
 // ---------------------------------------------------------------------------

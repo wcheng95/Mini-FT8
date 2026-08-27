@@ -49,7 +49,7 @@ static const ble_uuid128_t k_chr_config       = BLE_UUID128_INIT(BLE_NATIVE_CHR_
 static const ble_uuid128_t k_chr_radio_stream = BLE_UUID128_INIT(BLE_NATIVE_CHR_RADIO_STREAM);
 static const ble_uuid128_t k_chr_rpc_req      = BLE_UUID128_INIT(BLE_NATIVE_CHR_RPC_REQ);
 static const ble_uuid128_t k_chr_rpc_resp     = BLE_UUID128_INIT(BLE_NATIVE_CHR_RPC_RESP);
-static const ble_uuid128_t k_chr_adif_stream  = BLE_UUID128_INIT(BLE_NATIVE_CHR_ADIF_STREAM);
+static const ble_uuid128_t k_chr_log_stream   = BLE_UUID128_INIT(BLE_NATIVE_CHR_LOG_STREAM);
 
 // ---------------------------------------------------------------------------
 // Connection / subscription state
@@ -61,12 +61,12 @@ static uint16_t s_mtu         = 23;   // negotiate up on connect
 static uint16_t s_h_events       = 0;
 static uint16_t s_h_radio_stream = 0;
 static uint16_t s_h_rpc_resp     = 0;
-static uint16_t s_h_adif_stream  = 0;
+static uint16_t s_h_log_stream   = 0;
 
 static bool s_sub_events       = false;
 static bool s_sub_radio        = false;
 static bool s_sub_rpc_resp     = false;
-static bool s_sub_adif         = false;
+static bool s_sub_log          = false;
 
 // ---------------------------------------------------------------------------
 // Event dirty flags (set by core_api callbacks, drained by TX task)
@@ -97,18 +97,30 @@ struct WaterfallSlot {
 };
 static WaterfallSlot s_wf_slot;
 
-// Most day-logs returned by one adif_list. Bounded by the 256-byte RPC
+// Most day-logs returned by one log_days. Bounded by the 256-byte RPC
 // response, not by storage — "n" in the response carries the true total.
-static constexpr int kAdifListMax = 10;
+static constexpr int kLogDaysMax = 10;
 
-// ADIF streaming state
-struct AdifStreamState {
-  volatile bool active   = false;
-  int           handle   = -1;
-  int           total    = 0;
-  bool          eof_sent = false;
+// Log streaming state. One entry per indication: an ADIF record has a schema
+// and a bounded size, so it fits a single MTU with room to spare and needs no
+// chunk-reassembly on the client.
+// core_log_read is stateless — it opens, scans to `from`, and closes — so
+// fetching one entry at a time would rescan the day file per entry. Pulling a
+// small batch amortises that without reintroducing a file handle that a
+// dropped link could leak.
+static constexpr int kLogBatch = 8;
+
+struct LogStreamState {
+  volatile bool active     = false;
+  char          date[9]    = {0};
+  int           next       = 0;   // next entry index to fetch
+  int           remaining  = 0;   // entries still owed to the client
+  bool          eof_sent   = false;
+  CoreLogEntry  batch[kLogBatch];
+  int           batch_n    = 0;   // valid entries in `batch`
+  int           batch_i    = 0;   // next slot to send
 };
-static AdifStreamState s_adif;
+static LogStreamState s_log;
 
 // RPC request/response queue items are POD — std::string can't ride in a
 // FreeRTOS queue (xQueueSend memcpys raw bytes, bypassing the copy ctor,
@@ -476,8 +488,8 @@ static const struct ble_gatt_chr_def k_chrs[] = {
     BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP, 0, nullptr, nullptr },
   { &k_chr_rpc_resp.u,     chr_notify_only_cb, nullptr, nullptr,
     BLE_GATT_CHR_F_NOTIFY, 0, &s_h_rpc_resp, nullptr },
-  { &k_chr_adif_stream.u,  chr_notify_only_cb, nullptr, nullptr,
-    BLE_GATT_CHR_F_INDICATE, 0, &s_h_adif_stream, nullptr },
+  { &k_chr_log_stream.u,   chr_notify_only_cb, nullptr, nullptr,
+    BLE_GATT_CHR_F_INDICATE, 0, &s_h_log_stream, nullptr },
   { nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr }
 };
 
@@ -492,19 +504,16 @@ static const struct ble_gatt_svc_def k_svcs[] = {
 
 void ble_native_on_connect(uint16_t conn_handle) {
   s_conn_handle = conn_handle;
-  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_adif = false;
-  s_adif.active = false;
-  s_adif.handle = -1;
+  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_log = false;
+  s_log.active = false;
 }
 
 void ble_native_on_disconnect(void) {
   s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_adif = false;
-  if (s_adif.active) {
-    core_adif_close(s_adif.handle);
-    s_adif.active = false;
-    s_adif.handle = -1;
-  }
+  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_log = false;
+  // No file handle to release — core_log_read opens and closes per batch, so
+  // a dropped link leaves nothing behind for the next client to trip over.
+  s_log.active = false;
 }
 
 void ble_native_on_mtu(uint16_t mtu) {
@@ -515,7 +524,7 @@ void ble_native_on_subscribe(uint16_t attr_handle, bool notify_en, bool indicate
   if (attr_handle == s_h_events)       s_sub_events   = notify_en;
   if (attr_handle == s_h_radio_stream) s_sub_radio    = notify_en;
   if (attr_handle == s_h_rpc_resp)     s_sub_rpc_resp = notify_en;
-  if (attr_handle == s_h_adif_stream)  s_sub_adif     = indicate_en;
+  if (attr_handle == s_h_log_stream)   s_sub_log      = indicate_en;
 }
 
 // ---------------------------------------------------------------------------
@@ -719,52 +728,61 @@ RpcResult dispatch_rpc(const std::string& cmd, cJSON* args) {
   if (cmd == BLE_NATIVE_RPC_IGNORE_CLEAR) {
     return core_cmd_ignore_clear() ? res_ok() : res_err("ignore_clear");
   }
-  if (cmd == BLE_NATIVE_RPC_ADIF_LIST) {
-    // Newest-first day-logs with sizes, so the client can diff against its
-    // own cursors and fetch only what changed. The whole response has to fit
+  if (cmd == BLE_NATIVE_RPC_LOG_DAYS) {
+    // Newest-first day-logs with entry counts. The whole response must fit
     // kRpcJsonMax (256 B) including the {"id":N,"ok":true...} envelope, so
-    // cap the array and report the true total separately in "n".
-    CoreAdifFileInfo files[kAdifListMax];
-    int total = core_adif_list(files, kAdifListMax);
-    int shown = total < kAdifListMax ? total : kAdifListMax;
+    // the array is capped and the true total reported separately in "n".
+    CoreLogDay days[kLogDaysMax];
+    const int total = core_log_list_days(days, kLogDaysMax);
+    const int shown = total < kLogDaysMax ? total : kLogDaysMax;
 
-    // Budget: envelope is at most ~22 B, closing brace 1, NUL 1. Stop early
-    // if an entry would not fit rather than emitting truncated JSON.
     constexpr size_t kExtraBudget = kRpcJsonMax - 32;
-    std::string extra = ",\"n\":" + std::to_string(total) + ",\"f\":[";
+    std::string extra = ",\"n\":" + std::to_string(total) + ",\"d\":[";
     for (int i = 0; i < shown; ++i) {
       char item[32];
       snprintf(item, sizeof(item), "%s\"%s:%d\"",
-               i ? "," : "", files[i].date, files[i].size);
+               i ? "," : "", days[i].date, days[i].entries);
+      // Stop early rather than emit truncated JSON.
       if (extra.size() + strlen(item) + 1 > kExtraBudget) break;
       extra += item;
     }
     extra += "]";
     return res_ok_extra(std::move(extra));
   }
-  if (cmd == BLE_NATIVE_RPC_ADIF_OPEN) {
-    if (s_adif.active) return res_err("adif busy");
-    // Both args optional: "d" defaults to today, "off" to 0. A non-zero
-    // offset resumes an interrupted or incremental download — day-logs are
-    // append-only, so bytes before the cursor can never have changed.
+  if (cmd == BLE_NATIVE_RPC_LOG_READ) {
+    if (s_log.active) return res_err("log busy");
+
+    // "d" defaults to today. "from" is the entry index to resume at: indices
+    // are stable because the day file is append-only, so a client holding
+    // entries 0..N-1 asks for N and gets only what was logged since.
     const std::string date = arg_str(args, "d");
-    const int         off  = arg_int(args, "off", 0);
-    CoreAdifHandle h = core_adif_open(date.empty() ? nullptr : date.c_str(), off);
-    if (h.id < 0) return res_err("adif open failed");
-    s_adif.handle   = h.id;
-    s_adif.total    = h.total;
-    s_adif.eof_sent = false;
-    s_adif.active   = true;
+    const int from = arg_int(args, "from", 0);
+    int       want = arg_int(args, "n", 0);
+
+    const int total = core_log_count(date.empty() ? nullptr : date.c_str());
+    if (total < 0) return res_err("no log for day");
+
+    int avail = total - (from < 0 ? 0 : from);
+    if (avail < 0) avail = 0;
+    if (want <= 0 || want > avail) want = avail;   // 0 means "all remaining"
+
+    snprintf(s_log.date, sizeof(s_log.date), "%s",
+             date.empty() ? "" : date.c_str());
+    s_log.next      = from < 0 ? 0 : from;
+    s_log.remaining = want;
+    s_log.batch_n   = 0;
+    s_log.batch_i   = 0;
+    s_log.eof_sent  = false;
+    s_log.active    = true;
+    wake_tx_task();
+
     char extra[48];
-    snprintf(extra, sizeof(extra), ",\"size\":%d,\"off\":%d", h.total, h.offset);
+    snprintf(extra, sizeof(extra), ",\"n\":%d,\"total\":%d", want, total);
     return res_ok_extra(extra);
   }
-  if (cmd == BLE_NATIVE_RPC_ADIF_CLOSE) {
-    if (s_adif.active) {
-      core_adif_close(s_adif.handle);
-      s_adif.active = false;
-      s_adif.handle = -1;
-    }
+  if (cmd == BLE_NATIVE_RPC_LOG_ABORT) {
+    s_log.active   = false;
+    s_log.eof_sent = true;
     return res_ok();
   }
   return res_err("unknown cmd");
@@ -811,24 +829,75 @@ void handle_rpc(const std::string& body) {
 // TX task — pumps notifications and dispatches RPC requests.
 // ---------------------------------------------------------------------------
 
-static void pump_adif() {
-  if (!s_adif.active || !s_sub_adif) return;
-  // Chunk size = MTU - 3, capped at 200 for reliable indicate pacing.
-  size_t chunk = s_mtu > 3 ? (size_t)(s_mtu - 3) : 20;
-  if (chunk > 200) chunk = 200;
-
-  std::vector<uint8_t> buf;
-  if (core_adif_read(s_adif.handle, buf, chunk)) {
-    if (!buf.empty()) send_indicate(s_h_adif_stream, buf.data(), buf.size());
-    wake_tx_task();  // keep streaming without waiting for the poll timeout
-  } else if (!s_adif.eof_sent) {
-    // Zero-length indication = EOF marker.
-    send_indicate(s_h_adif_stream, nullptr, 0);
-    s_adif.eof_sent = true;
-    core_adif_close(s_adif.handle);
-    s_adif.active = false;
-    s_adif.handle = -1;
+// Escapes the few characters JSON forbids raw. Comments are operator-typed
+// free text (default "MiniFT8 /Radio"), so a stray quote is entirely possible
+// and would otherwise produce a payload the client can't decode.
+static void json_escape(const char* in, char* out, size_t out_sz) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 2 < out_sz; ++i) {
+    const unsigned char c = (unsigned char)in[i];
+    if (c == '"' || c == '\\') {
+      out[o++] = '\\';
+      out[o++] = (char)c;
+    } else if (c < 0x20) {
+      continue;                       // drop control characters
+    } else {
+      out[o++] = (char)c;
+    }
   }
+  out[o] = '\0';
+}
+
+static int log_entry_json(const CoreLogEntry& e, char* out, size_t out_sz) {
+  char comment[64];
+  json_escape(e.comment, comment, sizeof(comment));
+
+  // Reports are omitted when the node logged none, so absent stays
+  // distinguishable from a real 0 dB report on the client.
+  char rst[32] = "";
+  int  o = 0;
+  if (e.has_rst_sent) o += snprintf(rst + o, sizeof(rst) - o, ",\"s\":%d", e.rst_sent);
+  if (e.has_rst_rcvd)      snprintf(rst + o, sizeof(rst) - o, ",\"r\":%d", e.rst_rcvd);
+
+  return snprintf(out, out_sz,
+                  "{\"i\":%d,\"t\":\"%s\",\"c\":\"%s\",\"g\":\"%s\","
+                  "\"m\":\"%s\",\"f\":\"%s\",\"b\":\"%s\"%s,\"x\":\"%s\"}",
+                  e.index, e.time_on, e.call, e.grid,
+                  e.mode, e.freq, e.band, rst, comment);
+}
+
+static void pump_log() {
+  if (!s_log.active || !s_sub_log) return;
+
+  auto finish = [&]() {
+    if (!s_log.eof_sent) {
+      send_indicate(s_h_log_stream, nullptr, 0);   // zero length = done
+      s_log.eof_sent = true;
+    }
+    s_log.active = false;
+  };
+
+  if (s_log.remaining <= 0) { finish(); return; }
+
+  if (s_log.batch_i >= s_log.batch_n) {
+    const int want = s_log.remaining < kLogBatch ? s_log.remaining : kLogBatch;
+    const int got  = core_log_read(s_log.date[0] ? s_log.date : nullptr,
+                                   s_log.next, want, s_log.batch);
+    if (got <= 0) { finish(); return; }   // log shorter than promised
+    s_log.batch_n = got;
+    s_log.batch_i = 0;
+    s_log.next   += got;
+  }
+
+  char json[352];
+  int len = log_entry_json(s_log.batch[s_log.batch_i], json, sizeof(json));
+  if (len > 0) {
+    if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1;  // snprintf truncated
+    send_indicate(s_h_log_stream, json, (size_t)len);
+  }
+  s_log.batch_i++;
+  s_log.remaining--;
+  wake_tx_task();   // keep streaming without waiting for the poll timeout
 }
 
 static volatile bool s_tx_task_exit = false;
@@ -868,7 +937,7 @@ static void tx_task_main(void*) {
     }
 
     // ADIF streaming: pump one chunk per cycle (paces reliably under indicate).
-    pump_adif();
+    pump_log();
   }
 }
 

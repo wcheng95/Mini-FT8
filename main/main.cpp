@@ -1167,17 +1167,12 @@ static bool is_startup_direct_mode_key(char c) {
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 enum class QPageView { Default, Alternate };
-struct QsoLogEntry {
-  std::string time_on;
-  std::string band;
-  std::string call;
-  bool has_rst_rcvd = false;
-  int rst_rcvd = 0;
-  bool has_rst_sent = false;
-  int rst_sent = 0;
-};
+// Log entries come straight from core_api's reader — the one ADIF parser
+// this firmware has. The viewer used to parse the files itself, which is how
+// it ended up with a length-unaware field scanner that truncated any value
+// containing a space (the default comment, "MiniFT8 /Radio", is one).
 static QPageView g_q_page_view = QPageView::Default;
-static std::vector<QsoLogEntry> g_q_entries;
+static std::vector<CoreLogEntry> g_q_entries;
 static bool g_q_show_entries = false;
 static int q_page = 0;
 static std::string g_q_current_file;
@@ -1516,39 +1511,21 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   xSemaphoreGive(log_mutex);
 }
 
-static bool is_daily_qso_txt_file(const char* name) {
-  if (!name) return false;
-  if (strlen(name) != 12) return false;  // YYYYMMDD.txt
-  for (int i = 0; i < 8; ++i) {
-    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
-  }
-  return std::strcmp(name + 8, ".txt") == 0;
-}
-
 static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
-  DIR* dir = opendir("/storage");
-  if (!dir) {
-    g_q_lines.push_back("No QSO logs");
-    return;
+
+  CoreLogDay days[32];
+  const int total = core_log_list_days(days, 32);
+  const int shown = total < 32 ? total : 32;
+  for (int i = 0; i < shown; ++i) {
+    g_q_files.emplace_back(std::string(days[i].date) + ".txt");
+    g_q_lines.push_back(g_q_files.back());
   }
-  struct dirent* ent;
-  while ((ent = readdir(dir)) != nullptr) {
-    const char* name = ent->d_name;
-    if (is_daily_qso_txt_file(name)) {
-      g_q_files.emplace_back(name);
-    }
-  }
-  closedir(dir);
-  std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
+
   if (g_q_files.empty()) {
     g_q_lines.push_back("No QSO logs");
-    return;
-  }
-  for (size_t i = 0; i < g_q_files.size(); ++i) {
-    g_q_lines.push_back(g_q_files[i]);
   }
 }
 
@@ -1604,17 +1581,6 @@ static std::string qso_trim_head(const std::string& in, size_t max_len) {
   return in.substr(0, max_len - 1) + ">";
 }
 
-static bool qso_parse_rst(const std::string& raw, int& out) {
-  if (raw.empty()) return false;
-  char* end = nullptr;
-  long v = std::strtol(raw.c_str(), &end, 10);
-  if (end == raw.c_str() || !end || *end != '\0') return false;
-  if (v < -99) v = -99;
-  if (v > 99) v = 99;
-  out = static_cast<int>(v);
-  return true;
-}
-
 static std::string qso_format_signed3(bool has_value, int value) {
   if (!has_value) return "-??";
   char out[4];
@@ -1629,10 +1595,16 @@ static std::string qso_format_sent4(bool has_value, int value) {
   return out;
 }
 
+// core stores time_on as logged ("HHMMSS"); this view has always shown HH:MM.
+static std::string qso_hhmm(const char* hhmmss) {
+  if (!hhmmss || strlen(hhmmss) < 4) return "??:??";
+  return std::string(hhmmss, 2) + ":" + std::string(hhmmss + 2, 2);
+}
+
 static void qso_rebuild_entry_lines() {
   g_q_lines.clear();
   for (const auto& e : g_q_entries) {
-    std::string call_field = qso_trim_head(e.call, 11);
+    std::string call_field = qso_trim_head(e.call[0] ? e.call : "?", 11);
     if (call_field.size() < 11) {
       call_field.append(11 - call_field.size(), ' ');
     }
@@ -1642,8 +1614,9 @@ static void qso_rebuild_entry_lines() {
       const std::string sent = qso_format_sent4(e.has_rst_sent, e.rst_sent);
       g_q_lines.push_back(call_field + rcvd + " " + sent);
     } else {
-      const std::string band_disp = qso_trim_head(e.band, 6);
-      g_q_lines.push_back(e.time_on + " " + band_disp + " " + call_field);
+      const std::string band_disp =
+          qso_trim_head(e.band[0] ? e.band : (e.freq[0] ? e.freq : "?"), 6);
+      g_q_lines.push_back(qso_hhmm(e.time_on) + " " + band_disp + " " + call_field);
     }
   }
 
@@ -1655,62 +1628,29 @@ static void qso_rebuild_entry_lines() {
 static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
-  std::string full = std::string("/storage/") + path;
-  FILE* f = fopen(full.c_str(), "r");
-  if (!f) {
+
+  // Filenames are "YYYYMMDD.txt"; core addresses days by the date alone.
+  if (path.size() < 8) {
     g_q_lines.push_back("Open fail");
     return;
   }
-  char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    std::string s(line);
-    std::string s_lower = s;
-    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (s_lower.find("<call:") == std::string::npos) continue;
-    auto get_field = [&](const std::string& tag)->std::string {
-      size_t p = s_lower.find("<" + tag);
-      if (p == std::string::npos) return "";
-      size_t gt = s.find('>', p);
-      if (gt == std::string::npos) return "";
-      size_t end_space = s.find(' ', gt + 1);
-      size_t end_tag = s.find('<', gt + 1);
-      size_t end = s.size();
-      if (end_space != std::string::npos && end_space < end) end = end_space;
-      if (end_tag != std::string::npos && end_tag < end) end = end_tag;
-      return s.substr(gt + 1, end - gt - 1);
-    };
-    std::string call = get_field("call:");
-    std::string time_on = get_field("time_on:");
-    std::string freq = get_field("freq:");
-    std::string rst_rcvd_raw = get_field("rst_rcvd:");
-    std::string rst_sent_raw = get_field("rst_sent:");
-    std::string band = freq;
-    if (!freq.empty()) {
-      // crude map: take MHz and map to band name from our band list
-      double mhz = atof(freq.c_str());
-      for (const auto& b : g_bands) {
-        double bm = b.freq * 0.001;
-        if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
-      }
-    }
-    if (time_on.size() >= 4) {
-      time_on = time_on.substr(0,4);
-      time_on.insert(2, ":");
-    }
-    if (time_on.size() != 5) time_on = "??:??";
-    if (call.empty()) call = "?";
-    if (band.empty()) band = freq.empty() ? "?" : freq;
+  const std::string date = path.substr(0, 8);
 
-    QsoLogEntry e;
-    e.time_on = time_on;
-    e.band = band;
-    e.call = call;
-    e.has_rst_rcvd = qso_parse_rst(rst_rcvd_raw, e.rst_rcvd);
-    e.has_rst_sent = qso_parse_rst(rst_sent_raw, e.rst_sent);
-    g_q_entries.push_back(e);
+  // Pull in batches so a long day never needs one huge contiguous buffer.
+  constexpr int kBatch = 16;
+  CoreLogEntry batch[kBatch];
+  int from = 0;
+  while (true) {
+    const int n = core_log_read(date.c_str(), from, kBatch, batch);
+    if (n < 0) {
+      g_q_lines.push_back("Open fail");
+      return;
+    }
+    for (int i = 0; i < n; ++i) g_q_entries.push_back(batch[i]);
+    if (n < kBatch) break;
+    from += n;
   }
-  fclose(f);
+
   qso_rebuild_entry_lines();
 }
 

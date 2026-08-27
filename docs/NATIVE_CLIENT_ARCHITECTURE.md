@@ -183,41 +183,50 @@ tightly enough designed to be worth documenting here.
 | `RPC_RESP` | S→C | notify | Per-request response (JSON) |
 | `ADIF_STREAM` | S→C | indicate | Chunked reliable log download |
 
-### Worked-QSO log download
+### Worked-QSO log
 
 Logs live one file per UTC day at `/storage/YYYYMMDD.txt`, written by
-`log_adif_entry()`. A day's file is append-only while that day is current
-and immutable once it's past, which is what makes `(date, byte offset)` a
-durable resume cursor.
+`log_adif_entry()`. Reading them back goes through **one parser**, in
+`core_api.cpp` — both the Cardputer viewer and the BLE server call it, so the
+two cannot drift about what a record means. The viewer used to carry its own
+field scanner; that scanner ended values at the first space, which truncated
+any value containing one (the default comment is `MiniFT8 /Radio`).
 
 | RPC | Args | Response |
 |---|---|---|
-| `adif_list` | — | `{"n":<total days>,"f":["YYYYMMDD:<bytes>",…]}` newest first |
-| `adif_open` | `{"d":"YYYYMMDD","off":N}` (both optional) | `{"size":N,"off":M}` |
-| `adif_close` | — | — |
+| `log_days` | — | `{"n":<total days>,"d":["YYYYMMDD:<entries>",…]}` newest first |
+| `log_read` | `{"d":"YYYYMMDD","from":N,"n":M}` all optional | `{"n":<will send>,"total":<that day>}` |
+| `log_abort` | — | stops an in-flight stream |
 
-`adif_open` seeks to `off` and streams the rest over `ADIF_STREAM`;
-zero-length indication is EOF. Passing the byte count the client already
-holds for that day means only newly appended records cross the link, so a
-routine sync costs one open per day plus whatever was actually logged.
+`log_read` then streams that many entries over `LOG_STREAM`, **one entry per
+indication**; a zero-length indication ends it. An ADIF record has a schema
+and a bounded size, so each entry fits a single MTU — no chunk index, no
+reassembly on the client, and nothing for a client to re-parse.
 
-`f` is capped (`kAdifListMax`, currently 10) so the response fits the
-256-byte RPC buffer; `n` is the true count, so a client can tell it was
-truncated rather than silently under-reporting the log.
+```json
+{"i":0,"t":"142530","c":"W1ABC","g":"FN42","m":"FT8",
+ "f":"14.074","b":"20m","s":-12,"r":-8,"x":"MiniFT8 /Radio"}
+```
 
-Offsets must land on a record boundary — records end `<eor>`. The firmware
-does not validate this; a client that tracks "bytes through the last
-complete `<eor>`" is always correct, and one that doesn't gets a partial
-leading record its parser drops.
+`s`/`r` are omitted when the node logged no report, keeping "absent" distinct
+from a real 0 dB.
 
-Two ordering constraints, both load-bearing:
+**Entry indices are the cursor.** A day file is append-only, so an entry's
+index never changes once written. A client holding entries 0..N-1 asks for
+`from = N` and receives only what was logged since. Indices are stable across
+node reboots and immune to clock changes — which byte offsets also are, but
+timestamps are not, and the node's RTC gets pushed from the phone and GPS.
 
-- **Subscribe to `ADIF_STREAM` before `adif_open`.** The firmware only
-  pumps chunks while a subscriber exists and starts pumping as soon as the
-  RPC returns.
-- **One reader at a time.** `core_adif_open()` holds a single `FILE*`;
-  a second open answers `adif busy` until the first closes or the link
-  drops.
+`d` is capped (`kLogDaysMax`, currently 10) so the response fits the 256-byte
+RPC buffer; `n` carries the true count so truncation is detectable.
+
+Two ordering constraints:
+
+- **Subscribe to `LOG_STREAM` before `log_read`.** The firmware only pumps
+  while a subscriber exists and starts as soon as the RPC returns.
+- **One stream at a time.** A second `log_read` answers `log busy` until the
+  first finishes, is aborted, or the link drops. Unlike a file handle there is
+  nothing to leak: `core_log_read` opens and closes per batch.
 
 ### Why 8 characteristics, not one
 

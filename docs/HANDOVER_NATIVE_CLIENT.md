@@ -43,7 +43,7 @@ differ only in the last byte (see `ble_native.h`):
 | 06 | RADIO_STREAM | notify — binary waterfall rows (8-byte header + N bins) |
 | 07 | RPC_REQ | write — JSON `{"id":n,"cmd":"…","args":{…}}` |
 | 08 | RPC_RESP | notify — JSON `{"id":n,"ok":bool,"err":"…"}` |
-| 09 | ADIF_STREAM | indicate — binary ADIF file bytes; zero-length = EOF. `adif_list` enumerates day-logs, `adif_open {d,off}` resumes at a byte offset for incremental sync. See NATIVE_CLIENT_ARCHITECTURE.md. |
+| 09 | LOG_STREAM | indicate — one worked-QSO entry as JSON per packet; zero-length = end. Driven by `log_days` / `log_read {d,from,n}`. Firmware owns the only ADIF parser. |
 
 Flow: subscribe to EVENTS + RPC_RESP, read RX_LIST / QSO_QUEUE / CONFIG once,
 re-read on the matching event tag, subscribe to RADIO_STREAM for live

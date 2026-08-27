@@ -226,46 +226,57 @@ bool core_cmd_ignore_clear();
 bool core_cmd_save_config();   // persist to flash (most setters do this auto)
 
 // ---------------------------------------------------------------------------
-// ADIF bulk stream
+// Worked-QSO log
 //
-// Handle-based streaming read of a day's ADIF log. Caller polls
-// core_adif_read() repeatedly; returns false when EOF reached.
-// Multiple concurrent readers are not supported (single-reader invariant).
+// The node writes one ADIF file per UTC day, "/storage/YYYYMMDD.txt", from
+// log_adif_entry() in main.cpp. This is the single parser for reading them
+// back: both the Cardputer log viewer and the BLE server go through here, so
+// the two can't drift or disagree about what a record means.
 //
-// Logs are stored one file per UTC day, "/storage/YYYYMMDD.txt", written by
-// log_adif_entry() in main.cpp. A day's file is append-only while that day
-// is current and immutable thereafter, so (date, byte offset) is a stable
-// resume cursor: a client that has already read N bytes of a given day can
-// reopen at N and receive only what was appended since.
+// Access is per entry, not per byte. An ADIF record has a schema and a
+// bounded size, which makes it a far easier unit to reason about — and to
+// page over a link — than a byte range that a caller has to re-parse.
 //
-// The offset must land on a record boundary. Records end with "<eor>\n", so
-// a client that tracks "bytes up to and including the last complete <eor>"
-// always has a valid offset. The firmware does not validate this — a bogus
-// offset yields a partial first record, which the client's parser drops.
+// Entries are addressed by index within a day: 0 is the first QSO logged
+// that day, and because the file is append-only an entry's index never
+// changes once written. A caller holding "I have entries 0..N-1" asks for
+// `from = N` and receives only what was logged since.
+//
+// Fixed-size buffers throughout: these ride caller-provided arrays and must
+// not churn the heap. Over-long fields are truncated, never dropped.
 // ---------------------------------------------------------------------------
 
-struct CoreAdifHandle {
-  int  id;       // >= 0 on success, -1 on failure
-  int  total;    // total file size in bytes, or -1 if unknown
-  int  offset;   // byte position this session starts at
+struct CoreLogDay {
+  char date[9];   // "YYYYMMDD", NUL-terminated
+  int  entries;   // complete records in the file
 };
 
-// One day-log file. Enumerated newest-first by core_adif_list().
-struct CoreAdifFileInfo {
-  char date[9];  // "YYYYMMDD", NUL-terminated
-  int  size;     // bytes
+struct CoreLogEntry {
+  int  index;            // 0-based position within the day
+  char time_on[7];       // "HHMMSS" UTC, as logged
+  char call[16];         // worked station
+  char grid[9];          // their Maidenhead, may be empty
+  char mode[8];          // "FT8"
+  char freq[12];         // MHz as written, e.g. "14.074"
+  char band[8];          // derived from freq, e.g. "20m"; falls back to freq
+  char comment[32];      // truncated; the log keeps the full text
+  bool has_rst_sent;     // false when the node logged no report (-99)
+  int  rst_sent;
+  bool has_rst_rcvd;
+  int  rst_rcvd;
 };
 
-// Fills up to `max_out` entries, newest date first. Returns the total number
-// of day-logs present, which may exceed `max_out` — the caller can detect
-// truncation by comparing the return value against max_out.
-int core_adif_list(CoreAdifFileInfo* out, int max_out);
+// Day-logs present, newest date first. Returns the total number found, which
+// may exceed max_out; fills at most max_out. Entry counts come from a scan
+// for record terminators, not a full parse.
+int core_log_list_days(CoreLogDay* out, int max_out);
 
-// `yyyymmdd` selects the day-log; nullptr or "" means today. `offset` is the
-// byte position to resume from (0 = whole file). Fails if offset is past EOF.
-CoreAdifHandle core_adif_open(const char* yyyymmdd = nullptr, int offset = 0);
-// Reads the next chunk. Fills `out` with up to `max_bytes` bytes.
-// Returns true while more data is expected; false when EOF or error.
-bool           core_adif_read(int handle, std::vector<uint8_t>& out,
-                              size_t max_bytes = 256);
-void           core_adif_close(int handle);
+// Complete records in one day. -1 if the day has no log.
+int core_log_count(const char* yyyymmdd);
+
+// Reads up to max_out entries starting at index `from`. Returns how many
+// were filled, or -1 if the day has no log. A `from` past the end is not an
+// error — it yields 0, which is the steady state for a caller that is
+// already current.
+int core_log_read(const char* yyyymmdd, int from, int max_out,
+                  CoreLogEntry* out);
