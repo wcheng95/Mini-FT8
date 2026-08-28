@@ -22,7 +22,7 @@
 // ---------------------------------------------------------------------------
 // Protocol version — bump major on wire-incompatible change.
 // ---------------------------------------------------------------------------
-#define BLE_NATIVE_VERSION "1.1.0"
+#define BLE_NATIVE_VERSION "1.2.0"
 
 // ---------------------------------------------------------------------------
 // UUIDs
@@ -201,6 +201,12 @@ void ble_native_on_mtu(uint16_t mtu);
 // characteristic (from gap_cb subscribe event).
 void ble_native_on_subscribe(uint16_t attr_handle,
                              bool notify_en, bool indicate_en);
+
+// Called on every NOTIFY_TX gap event. Indication confirmations (and
+// failures) for the log stream free the one-outstanding-indication slot and
+// wake the TX task to send the next entry — the stream is paced by the
+// peer's acks, per ATT's one-indication-at-a-time rule.
+void ble_native_on_notify_tx(uint16_t attr_handle, int status, int indication);
 
 #ifdef __cplusplus
 }

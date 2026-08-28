@@ -115,12 +115,19 @@ struct LogStreamState {
   char          date[9]    = {0};
   int           next       = 0;   // next entry index to fetch
   int           remaining  = 0;   // entries still owed to the client
-  bool          eof_sent   = false;
   CoreLogEntry  batch[kLogBatch];
   int           batch_n    = 0;   // valid entries in `batch`
   int           batch_i    = 0;   // next slot to send
 };
 static LogStreamState s_log;
+
+// True while one log-stream indication is on the air and unconfirmed. ATT
+// allows exactly one outstanding indication per connection — NimBLE
+// debug-asserts on a second (ble_gatts_indicate_custom) — so the pump sends
+// one packet and waits for the peer's confirmation. The NOTIFY_TX gap event
+// clears this (host task) and wakes the TX task, so pacing rides the
+// connection interval; the 250 ms poll is only a fallback.
+static volatile bool s_log_ind_inflight = false;
 
 // RPC request/response queue items are POD — std::string can't ride in a
 // FreeRTOS queue (xQueueSend memcpys raw bytes, bypassing the copy ctor,
@@ -506,6 +513,7 @@ void ble_native_on_connect(uint16_t conn_handle) {
   s_conn_handle = conn_handle;
   s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_log = false;
   s_log.active = false;
+  s_log_ind_inflight = false;
 }
 
 void ble_native_on_disconnect(void) {
@@ -514,10 +522,23 @@ void ble_native_on_disconnect(void) {
   // No file handle to release — core_log_read opens and closes per batch, so
   // a dropped link leaves nothing behind for the next client to trip over.
   s_log.active = false;
+  // A confirmation that never came must not wedge the next session.
+  s_log_ind_inflight = false;
 }
 
 void ble_native_on_mtu(uint16_t mtu) {
   s_mtu = mtu;
+}
+
+void ble_native_on_notify_tx(uint16_t attr_handle, int status, int indication) {
+  if (!indication || attr_handle != s_h_log_stream) return;
+  // status 0 is "transmitted, awaiting confirmation" — keep waiting.
+  // BLE_HS_EDONE is the peer's ack; anything else is a failure. Either way
+  // the one-outstanding slot is free again.
+  if (status != 0) {
+    s_log_ind_inflight = false;
+    wake_tx_task();
+  }
 }
 
 void ble_native_on_subscribe(uint16_t attr_handle, bool notify_en, bool indicate_en) {
@@ -537,11 +558,14 @@ static void send_notify(uint16_t handle, const void* data, size_t len) {
   if (!om) return;
   ble_gatts_notify_custom(s_conn_handle, handle, om);
 }
-static void send_indicate(uint16_t handle, const void* data, size_t len) {
-  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return;
+// Returns false when nothing was handed to the stack (no connection, mbuf
+// pool empty — MSYS_2 is only 8 blocks — or NimBLE refused). Callers that
+// stream must not advance past a failed send.
+static bool send_indicate(uint16_t handle, const void* data, size_t len) {
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return false;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
-  if (!om) return;
-  ble_gatts_indicate_custom(s_conn_handle, handle, om);
+  if (!om) return false;
+  return ble_gatts_indicate_custom(s_conn_handle, handle, om) == 0;
 }
 
 static void send_event_ping(const char* evt_tag) {
@@ -772,7 +796,6 @@ RpcResult dispatch_rpc(const std::string& cmd, cJSON* args) {
     s_log.remaining = want;
     s_log.batch_n   = 0;
     s_log.batch_i   = 0;
-    s_log.eof_sent  = false;
     s_log.active    = true;
     wake_tx_task();
 
@@ -781,8 +804,7 @@ RpcResult dispatch_rpc(const std::string& cmd, cJSON* args) {
     return res_ok_extra(extra);
   }
   if (cmd == BLE_NATIVE_RPC_LOG_ABORT) {
-    s_log.active   = false;
-    s_log.eof_sent = true;
+    s_log.active = false;
     return res_ok();
   }
   return res_err("unknown cmd");
@@ -868,22 +890,28 @@ static int log_entry_json(const CoreLogEntry& e, char* out, size_t out_sz) {
 
 static void pump_log() {
   if (!s_log.active || !s_sub_log) return;
+  if (s_log_ind_inflight) return;   // one indication at a time; ack wakes us
 
-  auto finish = [&]() {
-    if (!s_log.eof_sent) {
-      send_indicate(s_h_log_stream, nullptr, 0);   // zero length = done
-      s_log.eof_sent = true;
+  if (s_log.remaining <= 0) {
+    // Zero-length indication = end marker, paced like any other packet.
+    s_log_ind_inflight = true;
+    if (send_indicate(s_h_log_stream, nullptr, 0)) {
+      s_log.active = false;
+    } else {
+      s_log_ind_inflight = false;   // nothing left the radio — retry on next wake
     }
-    s_log.active = false;
-  };
-
-  if (s_log.remaining <= 0) { finish(); return; }
+    return;
+  }
 
   if (s_log.batch_i >= s_log.batch_n) {
     const int want = s_log.remaining < kLogBatch ? s_log.remaining : kLogBatch;
     const int got  = core_log_read(s_log.date[0] ? s_log.date : nullptr,
                                    s_log.next, want, s_log.batch);
-    if (got <= 0) { finish(); return; }   // log shorter than promised
+    if (got <= 0) {                 // log shorter than promised
+      s_log.remaining = 0;          // end marker goes out on the next pump
+      wake_tx_task();
+      return;
+    }
     s_log.batch_n = got;
     s_log.batch_i = 0;
     s_log.next   += got;
@@ -891,13 +919,24 @@ static void pump_log() {
 
   char json[352];
   int len = log_entry_json(s_log.batch[s_log.batch_i], json, sizeof(json));
-  if (len > 0) {
-    if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1;  // snprintf truncated
-    send_indicate(s_h_log_stream, json, (size_t)len);
+  if (len <= 0) {                   // can't serialize: skip it, don't wedge
+    s_log.batch_i++;
+    s_log.remaining--;
+    wake_tx_task();
+    return;
   }
-  s_log.batch_i++;
-  s_log.remaining--;
-  wake_tx_task();   // keep streaming without waiting for the poll timeout
+  if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1;  // snprintf truncated
+
+  // Flag before sending: the confirmation lands on the host task, and
+  // setting it after a successful send would race a fast ack.
+  s_log_ind_inflight = true;
+  if (send_indicate(s_h_log_stream, json, (size_t)len)) {
+    s_log.batch_i++;
+    s_log.remaining--;
+    // No self-wake — the peer's confirmation drives the next entry.
+  } else {
+    s_log_ind_inflight = false;     // state untouched; the entry goes again
+  }
 }
 
 static volatile bool s_tx_task_exit = false;
