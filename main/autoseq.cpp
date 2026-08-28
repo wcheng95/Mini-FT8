@@ -206,15 +206,35 @@ static QsoContext* enqueue_one_shot(const std::string& dxcall,
 }
 
 void autoseq_start_cq(int slot_parity) {
-    // Don't add duplicate CQ in active zone
+    // One CQ at a time — but a repeat call is a statement of intent, not a
+    // duplicate: the beacon mode may have changed since the existing CQ was
+    // enqueued (the UI cycles OFF->EVEN->ODD, so reaching ODD passes through
+    // EVEN). Dropping the request here is how a CQ armed with stale parity
+    // fired on the wrong slot (RT260828: first CQ at :30 with beacon ODD).
+    // Retarget the existing entry instead.
     for (int i = 0; i < s_active_count; ++i) {
         if (s_queue[i].state == AutoseqState::CALLING && !s_queue[i].is_freetext) {
+            if ((s_queue[i].slot_id & 1) != (slot_parity & 1)) {
+                s_queue[i].slot_id = slot_parity & 1;
+                ESP_LOGI(TAG, "Retargeted CQ to slot %d", slot_parity & 1);
+                refresh_tx_msg_buffer();
+            }
             return;
         }
     }
     if (enqueue_one_shot("CQ", false, slot_parity)) {
         ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
         refresh_tx_msg_buffer();
+    }
+}
+
+void autoseq_cancel_cq() {
+    for (int i = 0; i < s_active_count; ++i) {
+        if (s_queue[i].state == AutoseqState::CALLING && !s_queue[i].is_freetext) {
+            autoseq_drop_index(i);
+            ESP_LOGI(TAG, "Canceled pending CQ");
+            return;
+        }
     }
 }
 

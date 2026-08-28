@@ -21,6 +21,7 @@ enum class BeaconMode { OFF = 0, EVEN, ODD };
 
 // ---------- Globals (subset of main.cpp) ----------
 static BeaconMode g_beacon = BeaconMode::OFF;
+static int g_violations = 0;
 
 // ---------- ADIF callback ----------
 static void adif_callback(const std::string& dxcall, const std::string& dxgrid,
@@ -171,26 +172,58 @@ int main(int argc, char* argv[]) {
         }
 
         // --- TX phase ---
+        // Mirrors main.cpp decode_monitor_results + check_slot_boundary:
+        // ARMING can happen in any period (main.cpp enqueues a beacon CQ at
+        // every no-pending decode boundary, parity taken from g_beacon);
+        // FIRING is parity-gated, like check_slot_boundary. Keep this block
+        // in sync with main.cpp — the old harness derived beacon parity from
+        // the test config instead of g_beacon and fired without the parity
+        // gate, which is exactly why the stale-parity beacon bug (RT260828)
+        // never showed up here.
         AutoseqTxEntry pending;
         bool has_tx = autoseq_fetch_pending_tx(pending);
 
-        // Beacon: if beacon is on, no active QSO TX, and this is our TX parity
-        if (!has_tx && g_beacon != BeaconMode::OFF && slot_parity == my_tx_parity) {
-            // Only enqueue CQ if beacon mode matches parity
-            bool beacon_match = (g_beacon == BeaconMode::EVEN && my_tx_parity == 0) ||
-                                (g_beacon == BeaconMode::ODD  && my_tx_parity == 1) ||
-                                // also match if user set EVEN but tx_on_even is false:
-                                // beacon_on=1 means "turn beacon on" regardless of parity
-                                true;
-            if (beacon_match) {
-                autoseq_start_cq(my_tx_parity);
+        if (g_beacon != BeaconMode::OFF) {
+            int target = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
+            if (!has_tx) {
+                autoseq_start_cq(target);                    // enqueue fresh
                 has_tx = autoseq_fetch_pending_tx(pending);
+            } else if (pending.dxcall == "CQ") {
+                autoseq_start_cq(target);                    // retarget stale parity
+                has_tx = autoseq_fetch_pending_tx(pending);  // re-fetch fresh
             }
+        } else if (has_tx && pending.dxcall == "CQ") {
+            autoseq_cancel_cq();                             // beacon off — drop it
+            has_tx = autoseq_fetch_pending_tx(pending);
+        }
+
+        bool held = false;
+        if (has_tx && (pending.slot_id & 1) != slot_parity) {
+            // Armed for the other parity — check_slot_boundary would not
+            // fire it in this slot. Hold it for the matching period.
+            printf("[Period %d] (armed '%s' for parity %d — holding)\n",
+                   p, pending.text.c_str(), pending.slot_id & 1);
+            has_tx = false;
+            held = true;
         }
 
         if (has_tx) {
             printf("[Period %d] TX: %s  (slot=%d offset=%dHz)\n",
                    p, pending.text.c_str(), pending.slot_id, pending.offset_hz);
+
+            // Invariant: a beacon CQ must fire on the parity the operator
+            // configured, and never while the beacon is off.
+            if (pending.dxcall == "CQ") {
+                const int fired = pending.slot_id & 1;
+                const bool ok =
+                    (g_beacon == BeaconMode::EVEN && fired == 0) ||
+                    (g_beacon == BeaconMode::ODD  && fired == 1);
+                if (!ok) {
+                    printf("*** VIOLATION: beacon CQ fired on parity %d with beacon=%s\n",
+                           fired, beacon_mode_str(g_beacon));
+                    ++g_violations;
+                }
+            }
 
             // Notify autoseq — this is where ADIF logging fires for TX4/TX5
             autoseq_on_tx_starting();
@@ -201,7 +234,7 @@ int main(int argc, char* argv[]) {
             // Post-TX tick for retry management
             int ms_to_boundary = 15000 - (int)(mock_clock_get() - period_base_ms);
             autoseq_tick(slot_idx, slot_parity, ms_to_boundary);
-        } else {
+        } else if (!held) {
             printf("[Period %d] (no TX)\n", p);
         }
 
@@ -215,6 +248,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("\n========== Test complete ==========\n");
+    if (g_violations) {
+        printf("\n========== Test complete: %d VIOLATION%s ==========\n",
+               g_violations, g_violations == 1 ? "" : "S");
+        return 1;
+    }
+    printf("\n========== Test complete: no violations ==========\n");
     return 0;
 }

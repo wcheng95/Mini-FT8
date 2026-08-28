@@ -1,0 +1,19 @@
+{
+  "config": {
+    "MY_CALLSIGN": "N6HAN",
+    "MY_GRID": "CM87",
+    "DX_CALLSIGN": "AG6AQ",
+    "DX_GRID": "CM97",
+    "TX_ON_EVEN": false
+  },
+  "periods": [
+    { "comment": "Period 0 (even): idle", "messages": [] },
+    { "comment": "Period 1 (odd): beacon EVEN — CQ armed for parity 0, held (wrong-parity period)",
+      "messages": [],
+      "beacon_change": { "time_offset": 5.0, "beacon_on": 1 } },
+    { "comment": "Period 2 (even): beacon OFF before the armed CQ ever fired — nothing may TX",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.5, "beacon_on": 0 } },
+    { "comment": "Period 3 (odd): still nothing", "messages": [] }
+  ]
+}

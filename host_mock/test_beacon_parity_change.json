@@ -1,0 +1,21 @@
+{
+  "config": {
+    "MY_CALLSIGN": "N6HAN",
+    "MY_GRID": "CM87",
+    "DX_CALLSIGN": "AG6AQ",
+    "DX_GRID": "CM97",
+    "TX_ON_EVEN": false
+  },
+  "periods": [
+    { "comment": "Period 0 (even): idle, beacon off", "messages": [] },
+    { "comment": "Period 1 (odd): tap 1 of the OFF->EVEN->ODD cycle lands on EVEN",
+      "messages": [],
+      "beacon_change": { "time_offset": 5.0, "beacon_on": 1 } },
+    { "comment": "Period 2 (even): tap 2 reaches ODD. Field bug RT260828: the stale EVEN CQ fires HERE",
+      "messages": [],
+      "beacon_change": { "time_offset": 1.0, "beacon_on": 2 } },
+    { "comment": "Period 3 (odd): correct behavior — first CQ belongs here", "messages": [] },
+    { "comment": "Period 4 (even): hold", "messages": [] },
+    { "comment": "Period 5 (odd): next CQ", "messages": [] }
+  ]
+}

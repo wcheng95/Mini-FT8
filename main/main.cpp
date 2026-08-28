@@ -4,6 +4,7 @@
 #include <cmath>
 #include "esp_log.h"
 #include "wear_levelling.h"
+#include "ff.h"
 extern "C" {
   #include "ft8/decode.h"
   #include "ft8/constants.h"
@@ -2657,6 +2658,20 @@ static void check_slot_boundary() {
     core_fire_qso_changed();  // propagates to all registered consumers
   }
 
+  // A CQ armed before a beacon change must not fire under the new mode.
+  // Boundary housekeeping retargets the queue, but an already-armed entry
+  // can still be waiting here (the fire window is the first 4 s of a slot).
+  if (g_qso_xmit && g_pending_tx_valid && g_pending_tx.dxcall == "CQ") {
+    const bool beacon_ok =
+        (g_beacon == BeaconMode::EVEN && g_target_slot_parity == 0) ||
+        (g_beacon == BeaconMode::ODD  && g_target_slot_parity == 1);
+    if (!beacon_ok) {
+      g_qso_xmit         = false;
+      g_pending_tx_valid = false;
+      ESP_LOGI(TAG, "Disarmed stale beacon CQ (beacon changed)");
+    }
+  }
+
   // TX trigger: check if we should start TX in this slot
   // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing,
   // and decode must be complete (TX is always triggered by decode results).
@@ -3187,16 +3202,31 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       g_last_reply_text = to_me_auto.front().text;
     }
 
+    // Keep this block in sync with host_mock/host_main.cpp's TX phase —
+    // the harness models exactly this glue, and the divergence is what let
+    // the stale-parity beacon bug escape it.
     AutoseqTxEntry pending;
-    if (autoseq_fetch_pending_tx(pending)) {
+    bool has_tx = autoseq_fetch_pending_tx(pending);
+    if (g_beacon != BeaconMode::OFF) {
+      if (!has_tx) {
+        enqueue_beacon_cq();                          // enqueue fresh CQ
+        has_tx = autoseq_fetch_pending_tx(pending);
+      } else if (pending.dxcall == "CQ") {
+        // The queued CQ may carry the parity of a beacon mode that is no
+        // longer set (the UI cycles OFF->EVEN->ODD, so reaching ODD passes
+        // through EVEN). start_cq retargets it; re-fetch the fresh parity.
+        enqueue_beacon_cq();
+        has_tx = autoseq_fetch_pending_tx(pending);
+      }
+    } else if (has_tx && pending.dxcall == "CQ") {
+      // Beacon just went off with its CQ still queued — drop it rather than
+      // let it fire once more.
+      autoseq_cancel_cq();
+      has_tx = autoseq_fetch_pending_tx(pending);
+    }
+    if (has_tx) {
       arm_pending_tx(pending);
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-    } else if (g_beacon != BeaconMode::OFF) {
-      enqueue_beacon_cq();
-      if (autoseq_fetch_pending_tx(pending)) {
-        arm_pending_tx(pending);
-        ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-      }
     }
   }
 
@@ -4616,20 +4646,26 @@ static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
     if (g_beacon != g_status_beacon_temp) {
-      bool was_off = (g_beacon == BeaconMode::OFF);
       g_beacon = g_status_beacon_temp;
       save_station_data();
-      // No need to clear autoseq when beacon is turned off.
-      // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
       core_fire_qso_changed();  // propagates to all registered consumers
 
-      // If beacon was just enabled, enqueue CQ and set TX flag
-      // TX will trigger at next slot boundary via check_slot_boundary()
-      if (was_off && g_beacon != BeaconMode::OFF) {
+      if (g_beacon != BeaconMode::OFF) {
+        // Enqueue — or retarget, if a CQ from the previous mode is still
+        // queued — and arm for the (possibly new) parity right away.
         enqueue_beacon_cq();
         AutoseqTxEntry pending;
         if (autoseq_fetch_pending_tx(pending)) {
           arm_pending_tx(pending);
+        }
+      } else {
+        // Beacon off: drop the queued CQ and disarm one already staged.
+        // (The old comment here said "any CQ in queue will transmit once" —
+        // that was the bug's off-mode twin, not a feature. RT260828.)
+        autoseq_cancel_cq();
+        if (g_pending_tx_valid && g_pending_tx.dxcall == "CQ") {
+          g_qso_xmit         = false;
+          g_pending_tx_valid = false;
         }
       }
     }
@@ -5036,6 +5072,18 @@ static esp_err_t mount_storage() {
     // Cardputer viewer both) will see. One line on the console proves the
     // whole day-listing path against the real filesystem without needing a
     // phone connected.
+    // Volume label — what macOS shows when MSC mode exposes this partition
+    // as a USB drive. FAT labels: 11 chars max, stored uppercase.
+    {
+      char label[24] = {0};
+      DWORD vsn = 0;
+      if (f_getlabel("0:", label, &vsn) == FR_OK &&
+          strcmp(label, "MINI-FT8") != 0) {
+        FRESULT fr = f_setlabel("0:MINI-FT8");
+        ESP_LOGI(TAG, "FATFS volume label -> MINI-FT8 (rc=%d)", (int)fr);
+      }
+    }
+
     CoreLogDay days[4];
     const int nd = core_log_list_days(days, 4);
     if (nd > 0) {

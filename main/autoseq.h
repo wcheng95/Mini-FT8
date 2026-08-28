@@ -123,6 +123,11 @@ bool autoseq_rotate_same_parity();
 // slot_parity: 0 for even slots, 1 for odd slots
 void autoseq_start_cq(int slot_parity);
 
+// Remove a pending beacon CQ (CALLING, non-freetext) if one is queued.
+// Called when the beacon turns off, so a CQ armed for a future slot can't
+// fire after the operator asked for silence.
+void autoseq_cancel_cq();
+
 // Schedule a Free Text one-shot transmission.
 // - Inherits slot parity from queue[0] if queue is non-empty, so FT joins the
 //   current activation period instead of colliding with other QSOs' slots.
