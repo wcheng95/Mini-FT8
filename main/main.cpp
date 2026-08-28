@@ -466,10 +466,6 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        // Indication confirmations pace the native log stream.
-        ble_native_on_notify_tx(event->notify_tx.attr_handle,
-                                event->notify_tx.status,
-                                event->notify_tx.indication);
         if (event->notify_tx.conn_handle == g_conn_handle &&
             event->notify_tx.attr_handle == gatt_tx_handle &&
             event->notify_tx.indication &&

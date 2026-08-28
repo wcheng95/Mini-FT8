@@ -22,7 +22,7 @@
 // ---------------------------------------------------------------------------
 // Protocol version — bump major on wire-incompatible change.
 // ---------------------------------------------------------------------------
-#define BLE_NATIVE_VERSION "1.2.0"
+#define BLE_NATIVE_VERSION "1.3.0"
 
 // ---------------------------------------------------------------------------
 // UUIDs
@@ -55,7 +55,7 @@
 #define BLE_NATIVE_CHR_RADIO_STREAM  BLE_NATIVE_UUID_SUFFIX(0x06)  // notify (binary)
 #define BLE_NATIVE_CHR_RPC_REQ       BLE_NATIVE_UUID_SUFFIX(0x07)  // write
 #define BLE_NATIVE_CHR_RPC_RESP      BLE_NATIVE_UUID_SUFFIX(0x08)  // notify
-#define BLE_NATIVE_CHR_LOG_STREAM    BLE_NATIVE_UUID_SUFFIX(0x09)  // indicate (JSON, one entry per packet)
+#define BLE_NATIVE_CHR_LOG_STREAM    BLE_NATIVE_UUID_SUFFIX(0x09)  // notify (JSON, one entry per packet)
 
 // ---------------------------------------------------------------------------
 // Event tags (in EVENTS notifications, JSON format).
@@ -157,12 +157,21 @@ static_assert(sizeof(BleRadioStreamHeader) == BLE_NATIVE_RADIO_STREAM_HEADER_SIZ
               "BleRadioStreamHeader packed size mismatch");
 
 // ---------------------------------------------------------------------------
-// LOG_STREAM packet (JSON, indicate-mode, reliable).
+// LOG_STREAM packet (JSON, notify-mode).
 //
-// One worked-QSO entry per indication, so each packet is self-contained and
-// well inside MTU — no chunk index, no reassembly. A zero-length indication
-// ends the stream. Client must be subscribed before issuing log_read; the
-// firmware only pumps while a subscriber exists.
+// One worked-QSO entry per notification, so each packet is self-contained
+// and well inside MTU — no chunk index, no reassembly. A zero-length
+// notification ends the stream. Client must be subscribed before issuing
+// log_read; the firmware only pumps while a subscriber exists.
+//
+// Notify, not indicate — deliberately. This build is peripheral-only
+// (GATT client trimmed), and NimBLE routes the peer's indication ack
+// through the GATT-client dispatch table, so indications stall after one
+// packet: the ack arrives and is dropped as an unknown opcode. Reliability
+// comes from the layers we do have: the link layer delivers notifications
+// in order with retransmission, the firmware never advances past a send
+// the stack refused, and every entry carries its index — so a client can
+// verify the window it asked for and re-request from any missing index.
 //
 //   {"i":0,"t":"142530","c":"W1ABC","g":"FN42","m":"FT8",
 //    "f":"14.074","b":"20m","s":-12,"r":-8,"x":"MiniFT8 /Radio"}
@@ -202,11 +211,6 @@ void ble_native_on_mtu(uint16_t mtu);
 void ble_native_on_subscribe(uint16_t attr_handle,
                              bool notify_en, bool indicate_en);
 
-// Called on every NOTIFY_TX gap event. Indication confirmations (and
-// failures) for the log stream free the one-outstanding-indication slot and
-// wake the TX task to send the next entry — the stream is paced by the
-// peer's acks, per ATT's one-indication-at-a-time rule.
-void ble_native_on_notify_tx(uint16_t attr_handle, int status, int indication);
 
 #ifdef __cplusplus
 }

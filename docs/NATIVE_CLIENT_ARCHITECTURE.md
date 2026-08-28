@@ -181,7 +181,7 @@ tightly enough designed to be worth documenting here.
 | `RADIO_STREAM` | S→C | notify | Waterfall row + swr/pwr/ptt (lossy) |
 | `RPC_REQ` | C→S | write | Typed command request (JSON) |
 | `RPC_RESP` | S→C | notify | Per-request response (JSON) |
-| `ADIF_STREAM` | S→C | indicate | Chunked reliable log download |
+| `LOG_STREAM` | S→C | notify | Worked-QSO entries, one JSON entry per packet |
 
 ### Worked-QSO log
 
@@ -233,24 +233,24 @@ Two ordering constraints:
 We could multiplex everything through one characteristic with a type
 tag. Per-stream characteristics instead because:
 
-- **Per-stream QoS**: waterfall uses `notify` (lossy); ADIF uses
-  `indicate` (reliable with per-chunk ack). Can't mix modes on one
-  characteristic.
+- **Per-stream QoS**: waterfall rows are take-the-latest (a dropped row is
+  a one-pixel gap); log entries are must-arrive (verified by index, see
+  below). Different delivery contracts want different characteristics.
 - **Per-stream subscription**: a client that only wants the radio
   stream (e.g. a waterfall-only viewer) subscribes to one
   characteristic and ignores the rest. The firmware doesn't send what
   nobody's listening to.
 - **Per-stream sizing**: `CONFIG` is ~500 bytes (fine as a single
-  GATT read). `RADIO_STREAM` rows are ~640 bytes each at 6 Hz. `ADIF`
-  can be hundreds of KB chunked.
+  GATT read). `RADIO_STREAM` rows are ~640 bytes each at 6 Hz. A log
+  entry is a self-contained ~150-byte packet.
 - **Clearer wire semantics**: the characteristic UUID *is* the event
   type. No discriminator byte to manage.
 
 ### Wire format: JSON
 
 All characteristics exchange UTF-8 JSON. Binary blobs (waterfall
-magnitudes, ADIF file bytes) travel as base64-encoded strings inside
-JSON.
+magnitudes) travel as base64-encoded strings inside JSON; worked-QSO
+entries travel as small JSON objects, one per packet.
 
 Rationale:
 - **One format to parse on both sides** (cJSON on ESP-IDF, dart:convert
@@ -276,8 +276,17 @@ characteristics.
   - `RADIO_STREAM` is a continuous stream; a dropped row means a
     one-pixel gap in the waterfall
   - `RPC_RESP` is paired with a client-side timeout per RPC
-- **`indicate`** (reliable, per-packet ack): used for `ADIF_STREAM`.
-  Losing log bytes would be permanent data loss.
+- **`indicate` is not used at all — it cannot work on this build.** The
+  firmware is peripheral-only (`CONFIG_BT_NIMBLE_GATT_CLIENT` trimmed for
+  heap, e8a8e77), and NimBLE dispatches the peer's Handle-Value-Confirmation
+  through the GATT-client table (`ble_att.c`, `#if MYNEWT_VAL(BLE_GATTC)`).
+  An indication goes out, the phone's ack is dropped as an unknown opcode,
+  and the stack waits forever: every indication-based path stalls after one
+  packet. `LOG_STREAM` therefore uses `notify`, with reliability supplied by
+  the layers that do exist: the link layer delivers notifications in order
+  with retransmission, the firmware never advances past a send the stack
+  refused, and every entry carries its index, so the client verifies the
+  window it requested and re-requests from any missing index.
 - **`read`** (on-demand pull): used for all snapshots. The GATT
   layer handles fragmentation if the payload exceeds MTU.
 

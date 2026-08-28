@@ -121,14 +121,6 @@ struct LogStreamState {
 };
 static LogStreamState s_log;
 
-// True while one log-stream indication is on the air and unconfirmed. ATT
-// allows exactly one outstanding indication per connection — NimBLE
-// debug-asserts on a second (ble_gatts_indicate_custom) — so the pump sends
-// one packet and waits for the peer's confirmation. The NOTIFY_TX gap event
-// clears this (host task) and wakes the TX task, so pacing rides the
-// connection interval; the 250 ms poll is only a fallback.
-static volatile bool s_log_ind_inflight = false;
-
 // RPC request/response queue items are POD — std::string can't ride in a
 // FreeRTOS queue (xQueueSend memcpys raw bytes, bypassing the copy ctor,
 // and you get a double-free when both the sender's copy and the receiver's
@@ -496,7 +488,7 @@ static const struct ble_gatt_chr_def k_chrs[] = {
   { &k_chr_rpc_resp.u,     chr_notify_only_cb, nullptr, nullptr,
     BLE_GATT_CHR_F_NOTIFY, 0, &s_h_rpc_resp, nullptr },
   { &k_chr_log_stream.u,   chr_notify_only_cb, nullptr, nullptr,
-    BLE_GATT_CHR_F_INDICATE, 0, &s_h_log_stream, nullptr },
+    BLE_GATT_CHR_F_NOTIFY, 0, &s_h_log_stream, nullptr },
   { nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr }
 };
 
@@ -513,7 +505,6 @@ void ble_native_on_connect(uint16_t conn_handle) {
   s_conn_handle = conn_handle;
   s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_log = false;
   s_log.active = false;
-  s_log_ind_inflight = false;
 }
 
 void ble_native_on_disconnect(void) {
@@ -522,50 +513,43 @@ void ble_native_on_disconnect(void) {
   // No file handle to release — core_log_read opens and closes per batch, so
   // a dropped link leaves nothing behind for the next client to trip over.
   s_log.active = false;
-  // A confirmation that never came must not wedge the next session.
-  s_log_ind_inflight = false;
 }
 
 void ble_native_on_mtu(uint16_t mtu) {
   s_mtu = mtu;
 }
 
-void ble_native_on_notify_tx(uint16_t attr_handle, int status, int indication) {
-  if (!indication || attr_handle != s_h_log_stream) return;
-  // status 0 is "transmitted, awaiting confirmation" — keep waiting.
-  // BLE_HS_EDONE is the peer's ack; anything else is a failure. Either way
-  // the one-outstanding slot is free again.
-  if (status != 0) {
-    s_log_ind_inflight = false;
-    wake_tx_task();
-  }
-}
-
 void ble_native_on_subscribe(uint16_t attr_handle, bool notify_en, bool indicate_en) {
   if (attr_handle == s_h_events)       s_sub_events   = notify_en;
   if (attr_handle == s_h_radio_stream) s_sub_radio    = notify_en;
   if (attr_handle == s_h_rpc_resp)     s_sub_rpc_resp = notify_en;
-  if (attr_handle == s_h_log_stream)   s_sub_log      = indicate_en;
+  // Either bit: iOS caches GATT discovery, and a phone that discovered the
+  // indicate-era table may keep writing the indicate bit after a firmware
+  // update. We only ever send notifications; CoreBluetooth delivers those
+  // to the app regardless of which bit it wrote.
+  if (attr_handle == s_h_log_stream)   s_sub_log      = notify_en || indicate_en;
 }
 
 // ---------------------------------------------------------------------------
 // Notification helpers
 // ---------------------------------------------------------------------------
 
-static void send_notify(uint16_t handle, const void* data, size_t len) {
-  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return;
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
-  if (!om) return;
-  ble_gatts_notify_custom(s_conn_handle, handle, om);
-}
 // Returns false when nothing was handed to the stack (no connection, mbuf
-// pool empty — MSYS_2 is only 8 blocks — or NimBLE refused). Callers that
-// stream must not advance past a failed send.
-static bool send_indicate(uint16_t handle, const void* data, size_t len) {
+// pool empty — MSYS_2 is only 8 blocks — or the controller queue is full).
+// Fire-and-forget callers may ignore this; streaming callers must not
+// advance past a failed send.
+//
+// There is deliberately no indicate variant. This build is peripheral-only
+// (CONFIG_BT_NIMBLE_GATT_CLIENT trimmed in e8a8e77), and NimBLE dispatches
+// the peer's Handle-Value-Confirmation through the GATT-client table
+// (ble_att.c, #if MYNEWT_VAL(BLE_GATTC)) — so an indication goes out, the
+// phone's ack is dropped as an unknown opcode, and the stack waits forever.
+// Any indication-based path on this firmware stalls after one packet.
+static bool send_notify(uint16_t handle, const void* data, size_t len) {
   if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return false;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
   if (!om) return false;
-  return ble_gatts_indicate_custom(s_conn_handle, handle, om) == 0;
+  return ble_gatts_notify_custom(s_conn_handle, handle, om) == 0;
 }
 
 static void send_event_ping(const char* evt_tag) {
@@ -890,17 +874,13 @@ static int log_entry_json(const CoreLogEntry& e, char* out, size_t out_sz) {
 
 static void pump_log() {
   if (!s_log.active || !s_sub_log) return;
-  if (s_log_ind_inflight) return;   // one indication at a time; ack wakes us
 
   if (s_log.remaining <= 0) {
-    // Zero-length indication = end marker, paced like any other packet.
-    s_log_ind_inflight = true;
-    if (send_indicate(s_h_log_stream, nullptr, 0)) {
+    // Zero-length notification = end marker.
+    if (send_notify(s_h_log_stream, nullptr, 0)) {
       s_log.active = false;
-    } else {
-      s_log_ind_inflight = false;   // nothing left the radio — retry on next wake
     }
-    return;
+    return;   // on failure: state untouched; next wake or the 250 ms tick retries
   }
 
   if (s_log.batch_i >= s_log.batch_n) {
@@ -927,16 +907,14 @@ static void pump_log() {
   }
   if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1;  // snprintf truncated
 
-  // Flag before sending: the confirmation lands on the host task, and
-  // setting it after a successful send would race a fast ack.
-  s_log_ind_inflight = true;
-  if (send_indicate(s_h_log_stream, json, (size_t)len)) {
+  if (send_notify(s_h_log_stream, json, (size_t)len)) {
     s_log.batch_i++;
     s_log.remaining--;
-    // No self-wake — the peer's confirmation drives the next entry.
-  } else {
-    s_log_ind_inflight = false;     // state untouched; the entry goes again
+    wake_tx_task();   // more owed — keep going as fast as the stack accepts
   }
+  // A refused send leaves the entry exactly where it was; the fallback tick
+  // (or any other wake) retries it. Never advance past a packet the stack
+  // did not take — that is how entries would get silently lost.
 }
 
 static volatile bool s_tx_task_exit = false;
