@@ -648,7 +648,16 @@ bool log_is_day_file(const char* name) {
   for (int i = 0; i < 8; ++i) {
     if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
   }
-  return std::strcmp(name + 8, ".txt") == 0;
+  // Case-insensitive on the extension: with LFN disabled
+  // (CONFIG_FATFS_LFN_NONE, this project's config) FatFs stores the 8.3
+  // name created as "20260828.txt" — and hands it back from readdir — as
+  // "20260828.TXT". fopen matches either case, which is why the writer and
+  // the direct readers worked while the listing came back empty. That was
+  // the first on-hardware symptom of the BLE log viewer: a freshly logged
+  // QSO, and log_days returning no days. SPIFFS preserved case, so the old
+  // viewer's lowercase strcmp broke silently in the SPIFFS -> FATFS
+  // migration too.
+  return strcasecmp(name + 8, ".txt") == 0;
 }
 
 // Builds "/storage/YYYYMMDD.txt". A null or empty date means today, taken

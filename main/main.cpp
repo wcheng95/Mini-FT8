@@ -5036,6 +5036,18 @@ static esp_err_t mount_storage() {
       "/storage", "storage", &mount_config, &handle);
   if (err == ESP_OK) {
     s_storage_wl_handle = handle;
+    // Boot diagnostic: what the worked-QSO listing (BLE log_days and the
+    // Cardputer viewer both) will see. One line on the console proves the
+    // whole day-listing path against the real filesystem without needing a
+    // phone connected.
+    CoreLogDay days[4];
+    const int nd = core_log_list_days(days, 4);
+    if (nd > 0) {
+      ESP_LOGI(TAG, "QSO day-logs: %d (newest %s, %d entries)",
+               nd, days[0].date, days[0].entries);
+    } else {
+      ESP_LOGI(TAG, "QSO day-logs: none");
+    }
   } else {
     if (handle != WL_INVALID_HANDLE) {
       wl_unmount(handle);
