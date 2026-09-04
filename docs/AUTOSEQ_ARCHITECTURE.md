@@ -395,3 +395,47 @@ void on_audio_block() {
 5. **Event 2 before Event 3** - Decode processing completes before TX decision is made
 6. **Audio samples drive symbol timing** - RX/TX duration determined by sample count, not wall clock
 7. **Slot boundary uses wall clock** - 15s intervals based on system tick/RTC
+
+## Execution model on the ESP32: the owner task
+
+The reference design is single-threaded, and as of 2026-08-28 the port is
+too — for autoseq. Every call into `autoseq_*`, and every touch of the
+armed-TX state (`g_pending_tx`, `g_qso_xmit`, `g_target_slot_parity`),
+happens on the core-0 main loop. Nothing else may call in.
+
+Before this, three tasks did: the decode task on core 1 applied decodes and
+armed the TX, the main loop ticked and fired it, and the BLE RPC task
+touched/dropped/cleared. There were no locks. The defences were ordering
+flags (`g_was_txing`, `g_decode_in_progress`, `g_decode_applied_slot_idx`),
+which are conventions rather than enforcement: `volatile` orders nothing
+across cores on Xtensa, the `std::string`s inside `g_pending_tx` were copied
+on one core while read on the other, and `g_decode_applied_slot_idx` was a
+64-bit `volatile` whose read isn't even atomic on a 32-bit core. The
+comments in `check_slot_boundary` record an actual race hit on hardware.
+
+Now:
+
+- **Decode task** builds the small `to_me` vector (pure work on its own
+  `s_dec`) and posts it — always, even when empty — with the slot index.
+- **BLE RPC task** posts touch / clear / drop / freetext / config commands.
+  "ok" means *accepted*; the effect shows up in the next `QSO_QUEUE`
+  snapshot. Posting never blocks and never waits.
+- **Main loop** drains the queue at the top of `check_slot_boundary()`,
+  applies decodes (the beacon block that `host_mock` mirrors), arms or
+  re-arms, advances the decode barrier, ticks, fires. Single writer, single
+  reader, for all of it.
+- **Other tasks read a published snapshot.** After any change (autoseq's
+  generation counter, or the armed-TX state), the owner copies the active
+  contexts and the armed entry into `AutoseqOwnerSnapshot` under a small
+  mutex; `core_qso_*` reads that. The mutex guards a *copy*, not autoseq.
+
+This is also what makes the host harness honest: it was always
+single-threaded, so it could model the state machine but never the races.
+With the firmware single-threaded for autoseq, the harness's model and the
+firmware's execution are the same shape.
+
+Still outside this model, noted for a later pass: the BLE `tap_rx` path
+reads the decode task's static RX list (`ui_get_rx_entry`) to build its
+message, and station config globals (`g_call`, `g_grid`, `g_beacon`, …) are
+written by the RPC task and read on the main loop. Both are pre-existing
+and narrower than what this change closed.

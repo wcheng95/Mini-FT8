@@ -1300,6 +1300,7 @@ static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static void log_queue_lines();
+static void autoseq_owner_post_decodes(std::vector<UiRxLine>&& to_me, int64_t slot_idx);
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
@@ -2671,7 +2672,12 @@ static int resolve_tx_offset(const AutoseqTxEntry& e) {
 // "g_qso_xmit / g_target_slot_parity / g_pending_tx / g_pending_tx_valid"
 // block that used to be repeated at every scheduling site (autoseq tick,
 // beacon-on, freetext queue, BLE tap_rx, …).
+// Bumped whenever the armed-TX state changes (arm, fire, disarm) so the
+// owner republishes its snapshot even when autoseq itself didn't move.
+static uint32_t s_owner_gen = 0;
+
 void arm_pending_tx(const AutoseqTxEntry& pending) {
+  ++s_owner_gen;
   g_qso_xmit           = true;
   g_target_slot_parity = pending.slot_id & 1;
   g_pending_tx         = pending;
@@ -2679,7 +2685,222 @@ void arm_pending_tx(const AutoseqTxEntry& pending) {
   g_pending_tx_valid   = true;
 }
 
+// ---------------------------------------------------------------------------
+// Autoseq owner: the main loop is the only task that touches autoseq or the
+// armed-TX state. Everyone else posts here. See core_api_internal.h.
+// ---------------------------------------------------------------------------
+struct AutoseqCmd {
+  enum Kind : uint8_t { DECODES, TOUCH, CLEAR, DROP, FREETEXT, CONFIG, SKIP_TX1, MAX_RETRY };
+  Kind                  kind;
+  std::vector<UiRxLine> decodes;        // DECODES
+  int64_t               slot_idx = -1;  // DECODES: the RX slot these came from
+  UiRxLine              msg;            // TOUCH
+  std::string           text;           // FREETEXT
+  int                   ival = 0;       // DROP index / MAX_RETRY value / CONFIG what
+  bool                  bval = false;   // SKIP_TX1
+};
+
+static QueueHandle_t     s_asq       = nullptr;   // AutoseqCmd*
+static SemaphoreHandle_t s_snap_mtx  = nullptr;
+static AutoseqOwnerSnapshot s_snap;
+static uint32_t          s_pub_agen  = 0xFFFFFFFFu;
+static uint32_t          s_pub_ogen  = 0xFFFFFFFFu;
+
+static void autoseq_owner_init() {
+  s_asq      = xQueueCreate(8, sizeof(AutoseqCmd*));
+  s_snap_mtx = xSemaphoreCreateMutex();
+}
+
+// Never blocks the poster. A full queue drops the command with a warning —
+// the decode task must not stall behind the UI, and a dropped DECODES only
+// costs one slot's auto-replies, which the next decode pass repeats anyway.
+static bool owner_post(AutoseqCmd* c) {
+  if (!s_asq || xQueueSend(s_asq, &c, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "autoseq owner queue full — dropped cmd %d", (int)c->kind);
+    delete c;
+    return false;
+  }
+  return true;
+}
+
+void autoseq_owner_post_touch(const UiRxLine& msg) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::TOUCH; c->msg = msg; owner_post(c);
+}
+void autoseq_owner_post_clear() {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::CLEAR; owner_post(c);
+}
+void autoseq_owner_post_drop(int idx) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::DROP; c->ival = idx; owner_post(c);
+}
+void autoseq_owner_post_freetext(const std::string& text) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::FREETEXT; c->text = text; owner_post(c);
+}
+void autoseq_owner_post_config(AutoseqOwnerCfg what) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::CONFIG; c->ival = (int)what; owner_post(c);
+}
+void autoseq_owner_post_skip_tx1(bool skip) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::SKIP_TX1; c->bval = skip; owner_post(c);
+}
+void autoseq_owner_post_max_retry(int n) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::MAX_RETRY; c->ival = n; owner_post(c);
+}
+static void autoseq_owner_post_decodes(std::vector<UiRxLine>&& to_me, int64_t slot_idx) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::DECODES;
+  c->decodes = std::move(to_me); c->slot_idx = slot_idx; owner_post(c);
+}
+
+void autoseq_owner_get_snapshot(AutoseqOwnerSnapshot& out) {
+  if (!s_snap_mtx) { out = AutoseqOwnerSnapshot{}; return; }
+  if (xSemaphoreTake(s_snap_mtx, pdMS_TO_TICKS(50)) != pdTRUE) { out = AutoseqOwnerSnapshot{}; return; }
+  out = s_snap;
+  xSemaphoreGive(s_snap_mtx);
+}
+
+// Re-sync the armed TX with whatever is now at the head of the queue.
+// Used after mutations that can change the head (drop, clear): an armed
+// copy of an entry that no longer exists must not fire.
+static void owner_rearm() {
+  AutoseqTxEntry p;
+  if (autoseq_fetch_pending_tx(p)) {
+    arm_pending_tx(p);
+  } else if (!g_tx_active) {
+    ++s_owner_gen;
+    g_qso_xmit         = false;
+    g_pending_tx_valid = false;
+  }
+}
+
+// The decode-apply step, moved here from decode_monitor_results (it used to
+// run on the decode task, on core 1, racing everything below with the main
+// loop). Keep the beacon block in sync with host_mock/host_main.cpp's TX
+// phase — the harness models exactly this glue.
+static void autoseq_owner_apply_decodes(std::vector<UiRxLine>& to_me, int64_t slot_idx) {
+  if (!g_was_txing) {
+    if (!to_me.empty()) {
+      autoseq_on_decodes(to_me);
+      core_fire_qso_changed();  // propagates to all registered consumers
+      g_last_reply_text = to_me.front().text;
+    }
+
+    AutoseqTxEntry pending;
+    bool has_tx = autoseq_fetch_pending_tx(pending);
+    if (g_beacon != BeaconMode::OFF) {
+      if (!has_tx) {
+        enqueue_beacon_cq();                          // enqueue fresh CQ
+        has_tx = autoseq_fetch_pending_tx(pending);
+      } else if (pending.dxcall == "CQ") {
+        // The queued CQ may carry the parity of a beacon mode that is no
+        // longer set (the UI cycles OFF->EVEN->ODD, so reaching ODD passes
+        // through EVEN). start_cq retargets it; re-fetch the fresh parity.
+        enqueue_beacon_cq();
+        has_tx = autoseq_fetch_pending_tx(pending);
+      }
+    } else if (has_tx && pending.dxcall == "CQ") {
+      // Beacon just went off with its CQ still queued — drop it rather than
+      // let it fire once more.
+      autoseq_cancel_cq();
+      has_tx = autoseq_fetch_pending_tx(pending);
+    }
+    if (has_tx) {
+      arm_pending_tx(pending);
+      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+    }
+    log_queue_lines();
+  }
+  // Barrier for the TX trigger: this slot's decodes are applied. Written and
+  // read on this task only now — it used to be a 64-bit volatile written on
+  // core 1 and read on core 0, which isn't even an atomic read on Xtensa.
+  if (slot_idx > g_decode_applied_slot_idx) g_decode_applied_slot_idx = slot_idx;
+}
+
+static void autoseq_owner_drain() {
+  if (!s_asq) return;
+  AutoseqCmd* c = nullptr;
+  while (xQueueReceive(s_asq, &c, 0) == pdTRUE) {
+    switch (c->kind) {
+      case AutoseqCmd::DECODES:
+        autoseq_owner_apply_decodes(c->decodes, c->slot_idx);
+        break;
+      case AutoseqCmd::TOUCH: {
+        autoseq_on_touch(c->msg);
+        // Arm now so the pick is honoured at the next matching boundary
+        // instead of a slot later (mirrors the Cardputer RX-key handler).
+        AutoseqTxEntry p;
+        if (autoseq_fetch_pending_tx(p)) arm_pending_tx(p);
+        core_fire_qso_changed();
+        break;
+      }
+      case AutoseqCmd::CLEAR:
+        autoseq_clear();
+        owner_rearm();
+        core_fire_qso_changed();
+        break;
+      case AutoseqCmd::DROP:
+        if (autoseq_drop_index(c->ival)) {
+          owner_rearm();
+          core_fire_qso_changed();
+        }
+        break;
+      case AutoseqCmd::FREETEXT: {
+        // Fallback parity when the queue is empty: the next slot.
+        const int fallback = (int)(((rtc_now_ms() / 15000) + 1) & 1);
+        if (autoseq_schedule_freetext(c->text, fallback)) {
+          AutoseqTxEntry p;
+          if (autoseq_fetch_pending_tx(p)) arm_pending_tx(p);
+          core_fire_qso_changed();
+        }
+        break;
+      }
+      case AutoseqCmd::CONFIG:
+        if ((AutoseqOwnerCfg)c->ival == AutoseqOwnerCfg::STATION) {
+          autoseq_set_station(g_call, grid_ft8_4(g_grid));
+        } else {
+          update_autoseq_cq_type();
+        }
+        break;
+      case AutoseqCmd::SKIP_TX1:
+        autoseq_set_skip_tx1(c->bval);
+        break;
+      case AutoseqCmd::MAX_RETRY:
+        autoseq_set_max_retry(c->ival);
+        break;
+    }
+    delete c;
+  }
+}
+
+// Republish the read-only snapshot when autoseq or the armed TX changed.
+// Cheap when nothing did: two integer compares per main-loop iteration.
+static void autoseq_owner_publish_if_changed() {
+  const uint32_t agen = autoseq_generation();
+  if (agen == s_pub_agen && s_owner_gen == s_pub_ogen) return;
+  s_pub_agen = agen;
+  s_pub_ogen = s_owner_gen;
+
+  AutoseqOwnerSnapshot fresh;
+  autoseq_get_active_contexts(fresh.active);
+  // Prefer the armed entry: it carries the resolved offset (the random roll
+  // for RANDOM mode / beacon CQ), which is what actually goes on air.
+  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+    fresh.next = g_pending_tx;
+    fresh.next_valid = true;
+  } else {
+    fresh.next_valid = autoseq_fetch_pending_tx(fresh.next);
+  }
+
+  if (!s_snap_mtx) return;
+  if (xSemaphoreTake(s_snap_mtx, pdMS_TO_TICKS(20)) != pdTRUE) {
+    // Reader holding it; try again next iteration.
+    s_pub_agen = 0xFFFFFFFFu;
+    return;
+  }
+  s_snap = std::move(fresh);
+  xSemaphoreGive(s_snap_mtx);
+}
+
 static void check_slot_boundary() {
+  autoseq_owner_drain();   // everything posted since the last iteration
+
   int64_t now_ms = rtc_now_ms();
   int64_t slot_idx = now_ms / 15000;
   int slot_ms = (int)(now_ms % 15000);
@@ -2709,6 +2930,7 @@ static void check_slot_boundary() {
         (g_beacon == BeaconMode::EVEN && g_target_slot_parity == 0) ||
         (g_beacon == BeaconMode::ODD  && g_target_slot_parity == 1);
     if (!beacon_ok) {
+      ++s_owner_gen;
       g_qso_xmit         = false;
       g_pending_tx_valid = false;
       ESP_LOGI(TAG, "Disarmed stale beacon CQ (beacon changed)");
@@ -2741,6 +2963,7 @@ static void check_slot_boundary() {
       // This avoids a race condition where decode_monitor_results is still
       // writing g_pending_tx on core 1 while we read it on core 0.
       if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+        ++s_owner_gen;
         g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
         g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
 
@@ -2752,6 +2975,7 @@ static void check_slot_boundary() {
       }
     }
   }
+  autoseq_owner_publish_if_changed();
 }
 
   static void menu_flash_tick() {
@@ -3067,10 +3291,9 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
     ble_publish_decode_event(0);
     // No candidates means we processed the slot's audio but found nothing —
-    // still counts as "applied" for the TX-trigger guard.
-    if (g_decode_slot_idx > g_decode_applied_slot_idx) {
-      g_decode_applied_slot_idx = g_decode_slot_idx;
-    }
+    // still counts as "applied" for the TX-trigger guard. The owner task
+    // advances the barrier when it drains this empty batch.
+    autoseq_owner_post_decodes({}, g_decode_slot_idx);
     g_decode_in_progress = false;
     return;
   }
@@ -3215,8 +3438,11 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   // ---- Sort in-place: to_me first, CQ second, others last ----
   qsort(s_dec, s_dec_count, sizeof(DecodeMsg), dec_sort_cmp);
 
-  // ---- Autoseq: build small to_me vector at boundary (only to_me entries) ----
-  if (!g_was_txing) {
+  // ---- Autoseq: collect to_me decodes and hand them to the owner task ----
+  // This task (core 1) no longer touches autoseq or the armed-TX state. It
+  // builds the small to_me vector — pure work on s_dec — and posts it; the
+  // main loop applies it, arms the TX, and advances the decode barrier.
+  {
     std::vector<UiRxLine> to_me_auto;
     for (int i = 0; i < s_dec_count; ++i) {
       if (!s_dec[i].is_to_me) break;  // sorted, so once we pass to_me we're done
@@ -3238,40 +3464,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       rx.is_to_me = true;
       to_me_auto.push_back(std::move(rx));
     }
-
-    if (!to_me_auto.empty()) {
-      autoseq_on_decodes(to_me_auto);
-      core_fire_qso_changed();  // propagates to all registered consumers
-      g_last_reply_text = to_me_auto.front().text;
-    }
-
-    // Keep this block in sync with host_mock/host_main.cpp's TX phase —
-    // the harness models exactly this glue, and the divergence is what let
-    // the stale-parity beacon bug escape it.
-    AutoseqTxEntry pending;
-    bool has_tx = autoseq_fetch_pending_tx(pending);
-    if (g_beacon != BeaconMode::OFF) {
-      if (!has_tx) {
-        enqueue_beacon_cq();                          // enqueue fresh CQ
-        has_tx = autoseq_fetch_pending_tx(pending);
-      } else if (pending.dxcall == "CQ") {
-        // The queued CQ may carry the parity of a beacon mode that is no
-        // longer set (the UI cycles OFF->EVEN->ODD, so reaching ODD passes
-        // through EVEN). start_cq retargets it; re-fetch the fresh parity.
-        enqueue_beacon_cq();
-        has_tx = autoseq_fetch_pending_tx(pending);
-      }
-    } else if (has_tx && pending.dxcall == "CQ") {
-      // Beacon just went off with its CQ still queued — drop it rather than
-      // let it fire once more.
-      autoseq_cancel_cq();
-      has_tx = autoseq_fetch_pending_tx(pending);
-    }
-    if (has_tx) {
-      arm_pending_tx(pending);
-      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-    }
-    log_queue_lines();
+    autoseq_owner_post_decodes(std::move(to_me_auto), g_decode_slot_idx);
   }
 
   // ---- Zero-heap handoff: static s_dec[] → ui.cpp's static rx_lines[] ----
@@ -3299,12 +3492,8 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
              (int)heap_exit - (int)heap_entry);
   }
 
-  // Mark this slot's decode as fully applied BEFORE clearing the in-progress
-  // flag. Readers (TX trigger on core 0) must see the applied marker as soon
-  // as in_progress drops, not later.
-  if (g_decode_slot_idx > g_decode_applied_slot_idx) {
-    g_decode_applied_slot_idx = g_decode_slot_idx;
-  }
+  // The "decode applied" barrier is advanced by the owner task when it
+  // drains the batch posted above — not here, and not from this core.
   g_decode_in_progress = false;
 }
 
@@ -6224,6 +6413,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 }
 
 extern "C" void app_main(void) {
+  autoseq_owner_init();
   // Run the main application loop on core0.
   xTaskCreatePinnedToCore(app_task_core0, "app_core0", APP_CORE0_STACK_BYTES, nullptr, 5, nullptr, 0);
 }

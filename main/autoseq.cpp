@@ -622,7 +622,11 @@ static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int l
 // automatically). FT text is user-supplied and not derivable, so it lives
 // in the s_pending_ft_text sidecar (only one FT pending at a time, so a
 // single sidecar suffices).
+static uint32_t s_generation = 0;
+uint32_t autoseq_generation() { return s_generation; }
+
 static void refresh_tx_msg_buffer() {
+    ++s_generation;   // every public API that can change the queue ends here
     s_tx_msg_buffer.clear();
     if (s_active_count == 0) return;
     QsoContext* ctx = &s_queue[0];

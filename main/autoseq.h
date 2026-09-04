@@ -176,6 +176,10 @@ void autoseq_get_qso_states(std::vector<std::string>& out);
 // the "dead head" that silenced the beacon for 18 minutes on 2026-08-28.
 void autoseq_get_queue_log_lines(std::vector<std::string>& out);
 
+// Bumped on every mutation of the queue or the TX buffer. The owner task
+// republishes its read-only snapshot for other tasks when this changes.
+uint32_t autoseq_generation();
+
 // Copy the full active-zone QsoContext entries for structured consumers
 // (e.g. the core_api / BLE server). Returns active contexts only; inactive
 // zone is not included. Thread-safe snapshot.

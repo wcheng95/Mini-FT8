@@ -32,3 +32,34 @@ void core_fire_config_changed();
 void core_fire_waterfall_row(int sym,
                              const uint8_t* mag, int num_bins,
                              float swr, float pwr, bool ptt);
+
+#include <string>
+#include <vector>
+#include "autoseq.h"
+
+// ---------------------------------------------------------------------------
+// Autoseq owner task (main.cpp, core-0 main loop).
+//
+// autoseq has no locks and never will: every call into it happens on the
+// main loop, the way DXFT8 ran it single-threaded. Other tasks — the decode
+// task on core 1, the BLE RPC task — post work here and never touch autoseq
+// or the armed-TX state directly. Posting is fire-and-forget: an RPC "ok"
+// means accepted, and the result shows up in the next QSO_QUEUE snapshot.
+// ---------------------------------------------------------------------------
+enum class AutoseqOwnerCfg { STATION, CQ_TYPE };
+void autoseq_owner_post_touch(const UiRxLine& msg);
+void autoseq_owner_post_clear();
+void autoseq_owner_post_drop(int idx);
+void autoseq_owner_post_freetext(const std::string& text);
+void autoseq_owner_post_config(AutoseqOwnerCfg what);
+void autoseq_owner_post_skip_tx1(bool skip);
+void autoseq_owner_post_max_retry(int n);
+
+// Read-only snapshot published by the owner whenever autoseq changes.
+// This is what other tasks read instead of autoseq itself.
+struct AutoseqOwnerSnapshot {
+  std::vector<QsoContext> active;
+  AutoseqTxEntry          next{};
+  bool                    next_valid = false;
+};
+void autoseq_owner_get_snapshot(AutoseqOwnerSnapshot& out);

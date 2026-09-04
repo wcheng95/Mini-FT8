@@ -222,16 +222,19 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out) {
 
 // Defined in main.cpp. Read by core_get_qso so the BLE snapshot reflects
 // the firmware's resolved offset, not autoseq's pre-resolution placeholder.
-extern AutoseqTxEntry g_pending_tx;
-extern bool           g_pending_tx_valid;
+// Readers on other tasks (BLE building QSO_QUEUE) see the owner's published
+// snapshot, never autoseq itself. count() refreshes the local copy; the
+// index reads that follow use it, so a listing is one consistent snapshot.
+static AutoseqOwnerSnapshot s_qso_cache;
 
 int core_qso_active_count() {
-  return autoseq_active_count();
+  autoseq_owner_get_snapshot(s_qso_cache);
+  return (int)s_qso_cache.active.size();
 }
 
 bool core_qso_get_active(int idx, QsoEntry& out) {
-  QsoContext c;
-  if (!autoseq_get_active_context(idx, &c)) return false;
+  if (idx < 0 || idx >= (int)s_qso_cache.active.size()) return false;
+  const QsoContext& c = s_qso_cache.active[idx];
   out.dxcall        = c.dxcall;
   out.dxgrid        = c.dxgrid;
   out.state         = map_out(c.state);
@@ -247,35 +250,23 @@ bool core_qso_get_active(int idx, QsoEntry& out) {
 }
 
 bool core_qso_get_next_tx(NextTxEntry& out) {
-  // Prefer g_pending_tx when arm_pending_tx has fired — it carries the
-  // resolved offset (matching the actual TX, including the random roll
-  // for RANDOM mode and beacon CQ). autoseq's own pending entry only
-  // holds the *unresolved* offset (often 0 for fresh CQs), which is
-  // what was reaching BLE before and pinning the marker at the config
-  // default.
-  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
-    out.valid             = true;
-    out.text              = g_pending_tx.text;
-    out.dxcall            = g_pending_tx.dxcall;
-    out.slot_parity       = g_pending_tx.slot_id & 1;
-    out.offset_hz         = g_pending_tx.offset_hz;
-    out.retries_remaining = g_pending_tx.repeat_counter;
-    return true;
+  // The owner publishes the armed entry when one exists (resolved offset —
+  // the random roll for RANDOM mode / beacon CQ — i.e. what goes on air),
+  // else autoseq's intent so the client at least knows a TX is queued.
+  // Reads the copy core_qso_active_count() took, so a listing and its
+  // next_tx come from one snapshot rather than straddling a republish.
+  const AutoseqOwnerSnapshot& snap = s_qso_cache;
+  if (!snap.next_valid || snap.next.text.empty()) {
+    out.valid = false;
+    return false;
   }
-  // Not yet armed — surface autoseq's intent so the client at least
-  // knows a TX is queued, even if the offset is still placeholder.
-  AutoseqTxEntry pending{};
-  if (autoseq_fetch_pending_tx(pending)) {
-    out.valid             = true;
-    out.text              = pending.text;
-    out.dxcall            = pending.dxcall;
-    out.slot_parity       = pending.slot_id & 1;
-    out.offset_hz         = pending.offset_hz;
-    out.retries_remaining = pending.repeat_counter;
-    return true;
-  }
-  out.valid = false;
-  return false;
+  out.valid             = true;
+  out.text              = snap.next.text;
+  out.dxcall            = snap.next.dxcall;
+  out.slot_parity       = snap.next.slot_id & 1;
+  out.offset_hz         = snap.next.offset_hz;
+  out.retries_remaining = snap.next.repeat_counter;
+  return true;
 }
 
 void core_get_qso(QsoSnapshot& out) {
@@ -414,17 +405,8 @@ bool core_cmd_tap_rx(int rx_list_idx) {
   msg.slot_id   = entry.slot_id;
   msg.is_cq     = entry.is_cq;
   msg.is_to_me  = entry.is_to_me;
-  autoseq_on_touch(msg);
-
-  // Arm the TX state machine for the next matching slot boundary so the
-  // user's pick is honoured immediately instead of waiting for the next
-  // autoseq tick to pull in the pending TX (which would delay by 1-2
-  // slots). Mirrors the Cardputer RX-key handler.
-  AutoseqTxEntry pending{};
-  if (autoseq_fetch_pending_tx(pending)) {
-    arm_pending_tx(pending);
-  }
-  core_fire_qso_changed();
+  // Owner task applies it and arms the TX; "ok" here means accepted.
+  autoseq_owner_post_touch(msg);
   return true;
 }
 
@@ -439,24 +421,22 @@ bool core_cmd_cancel_tx() {
 }
 
 bool core_cmd_clear_qso_queue() {
-  autoseq_clear();
-  core_fire_qso_changed();
+  autoseq_owner_post_clear();
   return true;
 }
 
 bool core_cmd_drop_qso(int idx) {
-  const bool ok = autoseq_drop_index(idx);
-  if (ok) core_fire_qso_changed();
-  return ok;
+  if (idx < 0) return false;
+  autoseq_owner_post_drop(idx);
+  return true;
 }
 
 bool core_cmd_queue_freetext(const std::string& text) {
-  // fallback parity: opposite of whatever slot_id we last saw makes a safe
-  // "next slot" default. For step 2, use 0; main.cpp's actual path applies
-  // its own fallback when the queue is empty.
-  const bool ok = autoseq_schedule_freetext(text, 0);
-  if (ok) core_fire_qso_changed();
-  return ok;
+  if (text.empty()) return false;
+  // Accepted; a duplicate is dropped by the owner and simply never appears
+  // in the queue snapshot.
+  autoseq_owner_post_freetext(text);
+  return true;
 }
 
 extern bool sync_radio_to_current_band(const char* reason);
@@ -494,12 +474,12 @@ extern std::string grid_ft8_4(const std::string& grid);
 // MENU/STATUS edit handlers in main.cpp already do this; mirror it here.
 bool core_cmd_set_call(const std::string& call) {
   if (!apply_config_write([&]{ g_call = call; })) return false;
-  autoseq_set_station(g_call, grid_ft8_4(g_grid));
+  autoseq_owner_post_config(AutoseqOwnerCfg::STATION);
   return true;
 }
 bool core_cmd_set_grid(const std::string& grid) {
   if (!apply_config_write([&]{ g_grid = grid; })) return false;
-  autoseq_set_station(g_call, grid_ft8_4(g_grid));
+  autoseq_owner_post_config(AutoseqOwnerCfg::STATION);
   return true;
 }
 bool core_cmd_set_comment(const std::string& comment) {
@@ -511,7 +491,7 @@ bool core_cmd_set_cq_type(CoreCqType t) {
     ConfigGuard g;
     g_cq_type = map_in(t);
   }
-  update_autoseq_cq_type();
+  autoseq_owner_post_config(AutoseqOwnerCfg::CQ_TYPE);
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
@@ -521,7 +501,7 @@ bool core_cmd_set_cq_freetext(const std::string& text) {
     ConfigGuard g;
     g_cq_freetext = text;
   }
-  update_autoseq_cq_type();
+  autoseq_owner_post_config(AutoseqOwnerCfg::CQ_TYPE);
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
@@ -543,7 +523,7 @@ bool core_cmd_set_skip_tx1(bool skip) {
     ConfigGuard g;
     g_skip_tx1 = skip;
   }
-  autoseq_set_skip_tx1(skip);
+  autoseq_owner_post_skip_tx1(skip);
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
@@ -554,7 +534,7 @@ bool core_cmd_set_max_retry(int n) {
     ConfigGuard g;
     g_autoseq_max_retry = n;
   }
-  autoseq_set_max_retry(n);
+  autoseq_owner_post_max_retry(n);
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;
