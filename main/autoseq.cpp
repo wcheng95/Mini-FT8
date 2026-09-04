@@ -473,6 +473,21 @@ void autoseq_on_tx_starting() {
     }
 }
 
+void autoseq_get_queue_log_lines(std::vector<std::string>& out) {
+    out.clear();
+    char buf[96];
+    auto emit = [&](const QsoContext& c, char zone) {
+        snprintf(buf, sizeof(buf), "%c s%d t%d r%d %-9.9s %-6.6s %+3d %+3d %d/%d p%d%s%s",
+                 zone, (int)c.state, (int)c.next_tx, (int)c.rcvd_msg_type,
+                 c.dxcall.c_str(), c.dxgrid.c_str(), c.snr_tx, c.snr_rx,
+                 c.retry_counter, c.retry_limit, c.slot_id & 1,
+                 c.logged ? " L" : "", c.is_freetext ? " FT" : "");
+        out.emplace_back(buf);
+    };
+    for (int i = 0; i < s_active_count; ++i)                 emit(s_queue[i], 'a');
+    for (int i = s_inactive_start; i < AUTOSEQ_MAX_QUEUE; ++i) emit(s_queue[i], 'i');
+}
+
 void autoseq_get_qso_states(std::vector<std::string>& out) {
     out.clear();
     static const char* state_names[] = {
@@ -565,6 +580,20 @@ void autoseq_set_cq_type(AutoseqCqType type, const std::string& freetext) {
 }
 
 // ============== Internal helpers ==============
+
+// The message a context in state `s` should be sending — "keep sending what
+// matches our current state". One-shots (CALLING) use TX_NONE as their
+// evict-after-tick marker, so they map to TX_NONE on purpose.
+static TxMsgType canonical_next_tx(AutoseqState s) {
+    switch (s) {
+        case AutoseqState::REPLYING:     return TxMsgType::TX1;
+        case AutoseqState::REPORT:       return TxMsgType::TX2;
+        case AutoseqState::ROGER_REPORT: return TxMsgType::TX3;
+        case AutoseqState::ROGERS:       return TxMsgType::TX4;
+        case AutoseqState::SIGNOFF:      return TxMsgType::TX5;
+        default:                         return TxMsgType::TX_NONE;
+    }
+}
 
 static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int limit) {
     ctx->state = s;
@@ -781,6 +810,16 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
         if (looks_like_grid(f3)) {
             rcvd = TxMsgType::TX1;
             if (ctx && ctx->dxgrid.empty()) ctx->dxgrid = f3;
+        } else if (f3.size() > 2 && f3[0] == 'R' && f3[1] == ' ' &&
+                   looks_like_grid(f3.substr(2))) {
+            // Contest-style TX3 — "R <grid>" from WSJT-X grid-exchange modes
+            // (NA VHF etc.): DX acknowledges our report with their grid
+            // instead of a numeric report. It is a roger. snr_rx stays unset
+            // so the ADIF omits rst_rcvd rather than inventing one.
+            // RT260828: VE7MGU sent this seven times while we retried TX2
+            // into the ground because this read as "unknown".
+            rcvd = TxMsgType::TX3;
+            if (ctx && ctx->dxgrid.empty()) ctx->dxgrid = f3.substr(2);
         } else if (!f3.empty() && f3[0] == 'R' && f3.size() > 1) {
             int rpt = 0;
             if (looks_like_report(f3.substr(1), rpt)) {
@@ -834,6 +873,15 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
              override, (int)rcvd, (int)ctx->state);
 
     if (rcvd == TxMsgType::TX_NONE) {
+        // The state machine below is "locally total": every (state, rcvd)
+        // pair refreshes next_tx to the state's canonical message. This early
+        // return used to skip it, so a context that reactivate() brought back
+        // with next_tx=TX_NONE stayed unschedulable at the head of the queue
+        // and starved the beacon (RT260828, 18 minutes of silence). Keep the
+        // early return, keep the invariant.
+        if (ctx->next_tx == TxMsgType::TX_NONE) {
+            ctx->next_tx = canonical_next_tx(ctx->state);
+        }
         ESP_LOGW(TAG, "generate_response: rcvd=TX_NONE, returning false");
         return false;
     }
@@ -1074,6 +1122,18 @@ static void on_decode(const UiRxLine& msg) {
     // Check inactive zone for matching context — reactivate if found
     int inact_idx = find_inactive_by_dxcall(dxcall);
     if (inact_idx >= 0) {
+        // Only wake a parked context for a message the state machine can act
+        // on. Reactivation resets the retry counter, so waking on noise would
+        // let a station that never decodes us drive an unbounded retry storm
+        // (exhaust -> park -> wake -> exhaust...). It stays parked, metadata
+        // intact, until something parseable arrives. Probe on a copy:
+        // parse_rcvd_msg writes grid/report fields into the ctx.
+        QsoContext probe = s_queue[inact_idx];
+        if (parse_rcvd_msg(&probe, msg) == TxMsgType::TX_NONE) {
+            ESP_LOGW(TAG, "on_decode: %s is parked; '%s' is not actionable — leaving it parked",
+                     dxcall.c_str(), msg.field3.c_str());
+            return;
+        }
         ESP_LOGI(TAG, "on_decode: reactivating inactive ctx for %s", dxcall.c_str());
         reactivate(inact_idx);
         // After reactivation, the entry is at s_queue[s_active_count - 1].
@@ -1104,6 +1164,12 @@ static void on_decode(const UiRxLine& msg) {
         int rpt = 0;
         if (looks_like_report(f3.substr(1), rpt)) {
             ESP_LOGW(TAG, "on_decode: rejecting R+report from %s (no ctx, would lose snr_tx)",
+                     dxcall.c_str());
+            return;
+        }
+        // Contest-style "R <grid>" is TX3 too — same hazard.
+        if (f3.size() > 2 && f3[1] == ' ' && looks_like_grid(f3.substr(2))) {
+            ESP_LOGW(TAG, "on_decode: rejecting R+grid from %s (no ctx, would lose snr_tx)",
                      dxcall.c_str());
             return;
         }

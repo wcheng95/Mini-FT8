@@ -238,14 +238,37 @@ int main(int argc, char* argv[]) {
             printf("[Period %d] (no TX)\n", p);
         }
 
-        // --- Print queue state ---
-        std::vector<std::string> states;
-        autoseq_get_qso_states(states);
-        if (!states.empty()) {
-            printf("[Period %d] Queue (%d):", p, (int)states.size());
-            for (auto& s : states) printf("  [%s]", s.c_str());
-            printf("\n");
+        // Invariant: with the beacon on, its own parity never goes silent.
+        // Either a QSO transmits in this slot or the beacon CQ does; a held
+        // entry (armed for the other parity) is the only excuse.
+        if (g_beacon != BeaconMode::OFF && !has_tx && !held) {
+            const int bp = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
+            if (slot_parity == bp) {
+                printf("*** VIOLATION: beacon=%s but nothing transmitted on its parity %d\n",
+                       beacon_mode_str(g_beacon), bp);
+                ++g_violations;
+            }
         }
+
+        // Invariant: an active QSO at the head of the queue is always
+        // schedulable (next_tx != TX_NONE). One-shots (CALLING) legitimately
+        // carry TX_NONE as their evict-after-tick marker.
+        {
+            QsoContext head;
+            if (autoseq_get_active_context(0, &head) &&
+                head.state != AutoseqState::IDLE &&
+                head.state != AutoseqState::CALLING &&
+                head.next_tx == TxMsgType::TX_NONE) {
+                printf("*** VIOLATION: dead head — %s at queue[0] in state %d with next_tx=TX_NONE\n",
+                       head.dxcall.c_str(), (int)head.state);
+                ++g_violations;
+            }
+        }
+
+        // --- Queue snapshot, same lines the firmware writes to the RxTx log ---
+        std::vector<std::string> qlines;
+        autoseq_get_queue_log_lines(qlines);
+        for (auto& q : qlines) printf("[Period %d] Q %s\n", p, q.c_str());
     }
 
     if (g_violations) {

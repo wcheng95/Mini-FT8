@@ -227,6 +227,35 @@ construction (CQ ctxs have dxcall="CQ", never enter the inactive zone, and
 the override path always transitions immediately). See inline comment in
 `generate_response()` for the full proof.
 
+### Post-mortem 2026-08-28: the theorem had a hole
+
+RT260828, 20:10:30–20:28:32 UTC: after VE7MGU's retries ran out, the node
+went silent for 18 minutes with the beacon on, until the operator re-toggled
+it. The reconstruction (host_mock/test_contest_r_grid.json replays it):
+
+1. VE7MGU was in a grid-exchange contest mode and acknowledged our report
+   with `R CN89` — a legitimate TX3 the classifier didn't know, so every
+   ack read as `TX_NONE` and we retried TX2 until exhaustion.
+2. Exhausted → `move_to_inactive` (next_tx := TX_NONE). VE7MGU called
+   again → `reactivate()` → `generate_response()` → parse → `TX_NONE` →
+   **early return, above the state switch**. The "repairs it unconditionally"
+   sentence above was true of the switch and false of the function: the
+   one input that skips the switch is exactly the input a station that
+   can't be parsed keeps sending.
+3. Dead head at queue[0] (REPORT, next_tx=TX_NONE): the buffer is empty,
+   the beacon CQ is appended behind it, `refresh_tx_msg_buffer` only looks
+   at queue[0], tick never runs because nothing transmits. Permanent.
+
+Fixes: `R <grid>` classifies as TX3; the `TX_NONE` early return now
+refreshes `next_tx` to the canonical value first (`canonical_next_tx`);
+and `on_decode` only reactivates a parked context for a message it can act
+on — waking on noise would also reset the retry counter and let a station
+that never decodes us drive an unbounded retry storm. The harness now
+asserts two invariants on every period: an active QSO head is schedulable,
+and a beacon never goes silent on its own parity. It also prints the same
+`Q` queue-snapshot lines the firmware now writes to the RxTx log, so the
+next one of these is read off the log rather than reconstructed.
+
 ## Formal design notes
 
 ### Orthogonality of logical position and scheduling state

@@ -1,0 +1,44 @@
+{
+  "config": {
+    "MY_CALLSIGN": "N6HAN",
+    "MY_GRID": "CM87",
+    "DX_CALLSIGN": "VE7MGU",
+    "DX_GRID": "CN89",
+    "TX_ON_EVEN": true,
+    "CQ_TYPE": "POTA",
+    "MAX_RETRY": 3
+  },
+  "periods": [
+    { "comment": "P0 even: beacon EVEN -> CQ POTA", "messages": [],
+      "beacon_change": { "time_offset": 2.0, "beacon_on": 1 } },
+    { "comment": "P1 odd: VE7MGU answers with grid (TX1)", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "CN89", "snr": 16, "slot": 1, "freq_hz": 2138 } ] },
+    { "comment": "P2 even: we send TX2 +16", "messages": [] },
+    { "comment": "P3 odd: VE7MGU sends contest-style 'R CN89' (RT260828 200558); KK7TUN also calls", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 11, "slot": 1, "freq_hz": 2138 },
+      { "call_to": "N6HAN", "call_from": "KK7TUN", "locator": "DN42",   "snr": 4,  "slot": 1, "freq_hz": 962 } ] },
+    { "comment": "P4 even", "messages": [] },
+    { "comment": "P5 odd: KK7TUN R-11; VE7MGU R CN89 again", "messages": [
+      { "call_to": "N6HAN", "call_from": "KK7TUN", "locator": "R-11",   "snr": 5,  "slot": 1, "freq_hz": 962 },
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 14, "slot": 1, "freq_hz": 2131 } ] },
+    { "comment": "P6 even", "messages": [] },
+    { "comment": "P7 odd: KK7TUN 73; VE7MGU R CN89", "messages": [
+      { "call_to": "N6HAN", "call_from": "KK7TUN", "locator": "73",     "snr": 18, "slot": 1, "freq_hz": 962 },
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 26, "slot": 1, "freq_hz": 2138 } ] },
+    { "comment": "P8 even", "messages": [] },
+    { "comment": "P9 odd: VE7MGU R CN89", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 14, "slot": 1, "freq_hz": 2138 } ] },
+    { "comment": "P10 even", "messages": [] },
+    { "comment": "P11 odd: VE7MGU R CN89", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 28, "slot": 1, "freq_hz": 2138 } ] },
+    { "comment": "P12 even", "messages": [] },
+    { "comment": "P13 odd: VE7MGU R CN89 (RT260828 201058 — arrives after our retries ran out)", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 23, "slot": 1, "freq_hz": 2131 } ] },
+    { "comment": "P14 even: beacon must not be silent here", "messages": [] },
+    { "comment": "P15 odd: VE7MGU R CN89 (201128)", "messages": [
+      { "call_to": "N6HAN", "call_from": "VE7MGU", "locator": "R CN89", "snr": 2, "slot": 1, "freq_hz": 2131 } ] },
+    { "comment": "P16 even: beacon must not be silent here", "messages": [] },
+    { "comment": "P17 odd: quiet", "messages": [] },
+    { "comment": "P18 even: beacon must not be silent here", "messages": [] }
+  ]
+}

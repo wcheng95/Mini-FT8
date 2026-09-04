@@ -164,6 +164,18 @@ void autoseq_on_tx_starting();
 // Get display strings for active QSOs
 void autoseq_get_qso_states(std::vector<std::string>& out);
 
+// Queue snapshot for the RxTx log, one line per context, DXFT8-style. The
+// firmware prefixes each with "Q [ts][band] "; the host harness prints them
+// per period. Field key:
+//   a|i        zone: active / inactive (parked)
+//   s<n>       state      (CALLING=0 REPLYING=1 REPORT=2 ROGER_REPORT=3 ROGERS=4 SIGNOFF=5 IDLE=6)
+//   t<n>       next_tx    (0=none 1..5=TX1..TX5)
+//   r<n>       rcvd_msg_type, last classified message from DX
+//   dxcall grid snr_tx snr_rx retry/limit p<parity>  [L]=logged  [FT]=free text
+// A context in the active zone with s>1 and t0 is unschedulable: that is
+// the "dead head" that silenced the beacon for 18 minutes on 2026-08-28.
+void autoseq_get_queue_log_lines(std::vector<std::string>& out);
+
 // Copy the full active-zone QsoContext entries for structured consumers
 // (e.g. the core_api / BLE server). Returns active contexts only; inactive
 // zone is not included. Thread-safe snapshot.

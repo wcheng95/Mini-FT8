@@ -1299,6 +1299,7 @@ static void qso_load_entries(const std::string& path);
 static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
+static void log_queue_lines();
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
@@ -1509,6 +1510,47 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
   }
 
   fclose(f);
+  xSemaphoreGive(log_mutex);
+}
+
+// Queue snapshot into the RxTx log, one "Q" line per context — the habit
+// DXFT8 had and this port dropped. Written after every autoseq mutation
+// point, so a wedged queue shows up in the log directly instead of having to
+// be reconstructed from T/R lines, which is how RT260828's 18-minute silence
+// had to be diagnosed. Field key in autoseq.h (autoseq_get_queue_log_lines).
+static void log_queue_lines() {
+  if (!g_rxtx_log || !log_mutex) return;
+
+  std::vector<std::string> lines;
+  autoseq_get_queue_log_lines(lines);
+
+  // Quiet while idle: log an empty queue only once, as the transition.
+  static size_t last_n = 0;
+  if (lines.empty() && last_n == 0) return;
+  last_n = lines.size();
+
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+
+  char log_path[64];
+  build_rxtx_log_path(log_path, sizeof(log_path));
+
+  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  FILE* f = fopen(log_path, "a");
+  if (f) {
+    if (lines.empty()) {
+      fprintf(f, "Q [%s][%.3f] -\n", ts, freq_mhz);
+    } else {
+      for (const auto& l : lines) fprintf(f, "Q [%s][%.3f] %s\n", ts, freq_mhz, l.c_str());
+    }
+    fclose(f);
+  }
   xSemaphoreGive(log_mutex);
 }
 
@@ -2656,6 +2698,7 @@ static void check_slot_boundary() {
     autoseq_tick(slot_idx, slot_parity, 0);
     g_was_txing = false;
     core_fire_qso_changed();  // propagates to all registered consumers
+    log_queue_lines();
   }
 
   // A CQ armed before a beacon change must not fire under the new mode.
@@ -3228,6 +3271,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       arm_pending_tx(pending);
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
     }
+    log_queue_lines();
   }
 
   // ---- Zero-heap handoff: static s_dec[] → ui.cpp's static rx_lines[] ----

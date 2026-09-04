@@ -1,0 +1,26 @@
+{
+  "config": {
+    "MY_CALLSIGN": "N6HAN",
+    "MY_GRID": "CM87",
+    "DX_CALLSIGN": "AI7WP",
+    "DX_GRID": "CN87",
+    "TX_ON_EVEN": true,
+    "MAX_RETRY": 2
+  },
+  "periods": [
+    { "comment": "P0 even: beacon EVEN -> CQ", "messages": [],
+      "beacon_change": { "time_offset": 2.0, "beacon_on": 1 } },
+    { "comment": "P1 odd: AI7WP answers with grid", "messages": [
+      { "call_to": "N6HAN", "call_from": "AI7WP", "locator": "CN87", "snr": 6, "slot": 1, "freq_hz": 750 } ] },
+    { "comment": "P2 even: TX2", "messages": [] },
+    { "comment": "P3 odd: silence from AI7WP", "messages": [] },
+    { "comment": "P4 even: TX2 retry", "messages": [] },
+    { "comment": "P5 odd: silence", "messages": [] },
+    { "comment": "P6 even: TX2 last retry -> parked after tick", "messages": [] },
+    { "comment": "P7 odd: AI7WP sends something unparseable — must NOT wake a dead head", "messages": [
+      { "call_to": "N6HAN", "call_from": "AI7WP", "locator": "TU", "snr": 6, "slot": 1, "freq_hz": 750 } ] },
+    { "comment": "P8 even: beacon must resume CQ", "messages": [] },
+    { "comment": "P9 odd: quiet", "messages": [] },
+    { "comment": "P10 even: beacon CQ", "messages": [] }
+  ]
+}
