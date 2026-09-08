@@ -1,0 +1,20 @@
+name: Telemetry buffer safety test
+
+on:
+  push:
+    paths:
+      - ".github/workflows/telemetry-buffer-test.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/telemetry-buffer
+      - name: Configure
+        run: cmake -S tests/tx_e2e -B build/telemetry -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/telemetry --target test_telemetry_decode test_rx1a_boundaries -j2
+      - name: Test
+        run: ctest --test-dir build/telemetry -R '^(telemetry_decode|rx1a_boundaries)$' --output-on-failure
