@@ -817,7 +817,8 @@ ftx_message_rc_t ftx_message_decode(const ftx_message_t* msg, ftx_callsign_hash_
 {
     ftx_message_rc_t rc;
 
-    char field1_buf[16];
+    // Telemetry renders 18 hex characters plus the terminating NUL.
+    char field1_buf[19];
     char field2_buf[16];
     char field3_buf[48];
     char* field1 = field1_buf;

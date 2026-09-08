@@ -123,6 +123,15 @@ else()
     target_link_libraries(test_rx1a_boundaries PRIVATE ft8_lib m)
 endif()
 
+# Telemetry decode safety regression: 18 hex characters + NUL must fit.
+add_executable(test_telemetry_decode test_telemetry_decode.cpp)
+target_include_directories(test_telemetry_decode PRIVATE ${CMAKE_SOURCE_DIR})
+if(WIN32)
+    target_link_libraries(test_telemetry_decode PRIVATE ft8_lib)
+else()
+    target_link_libraries(test_telemetry_decode PRIVATE ft8_lib m)
+endif()
+
 # TA command format test
 add_executable(test_ta_format test_ta_format.cpp)
 target_include_directories(test_ta_format PRIVATE ${CMAKE_SOURCE_DIR})
@@ -168,5 +177,6 @@ add_test(NAME l3_poll_timing     COMMAND test_l3)
 add_test(NAME l4_timer_isolation COMMAND test_l4)
 add_test(NAME golden_rx          COMMAND test_golden_rx)
 add_test(NAME rx1a_boundaries    COMMAND test_rx1a_boundaries)
+add_test(NAME telemetry_decode   COMMAND test_telemetry_decode)
 add_test(NAME ta_format          COMMAND test_ta_format)
 add_test(NAME kh1_tone_map       COMMAND test_kh1_tone_map)
