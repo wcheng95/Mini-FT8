@@ -102,6 +102,18 @@ else()
     target_link_libraries(test_golden_rx PRIVATE ft8_lib m)
 endif()
 
+# RX-1A reference boundary dumper.  This is intentionally not a ctest target:
+# it exists to freeze reference values at a pinned V2 algorithm baseline.
+add_executable(rx1a_reference_dump rx1a_reference_dump.cpp decode_helper.cpp)
+target_include_directories(rx1a_reference_dump PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(rx1a_reference_dump PRIVATE "RX1A_GOLDEN_DIR=\"${CMAKE_SOURCE_DIR}/golden\"")
+target_compile_options(rx1a_reference_dump PRIVATE -Wno-format)
+if(WIN32)
+    target_link_libraries(rx1a_reference_dump PRIVATE ft8_lib)
+else()
+    target_link_libraries(rx1a_reference_dump PRIVATE ft8_lib m)
+endif()
+
 # TA command format test
 add_executable(test_ta_format test_ta_format.cpp)
 target_include_directories(test_ta_format PRIVATE ${CMAKE_SOURCE_DIR})
