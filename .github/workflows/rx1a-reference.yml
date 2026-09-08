@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - "tests/tx_e2e/rx1a_reference_dump.cpp"
+      - "tests/tx_e2e/test_rx1a_boundaries.cpp"
       - "tests/tx_e2e/CMakeLists.txt"
       - ".github/workflows/rx1a-reference.yml"
 
@@ -18,11 +19,11 @@ jobs:
       - name: Configure host tests
         run: cmake -S tests/tx_e2e -B build/rx1a -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build reference dumper and golden RX test
-        run: cmake --build build/rx1a --target rx1a_reference_dump test_golden_rx -j2
+      - name: Build RX reference tests
+        run: cmake --build build/rx1a --target rx1a_reference_dump test_rx1a_boundaries test_golden_rx -j2
 
-      - name: Existing golden RX sanity check
-        run: ctest --test-dir build/rx1a -R '^golden_rx$' --output-on-failure
+      - name: Run existing and boundary goldens
+        run: ctest --test-dir build/rx1a -R '^(golden_rx|rx1a_boundaries)$' --output-on-failure
 
       - name: Dump RX-1A boundary reference
         run: ./build/rx1a/rx1a_reference_dump
