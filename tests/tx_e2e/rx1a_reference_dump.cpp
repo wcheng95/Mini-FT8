@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "decode_helper.h"
@@ -29,6 +31,55 @@ extern "C" {
 #ifndef RX1A_GOLDEN_DIR
 #define RX1A_GOLDEN_DIR "golden"
 #endif
+
+// The older decode_helper test stub indexes only the full 22-bit value and
+// therefore cannot resolve 12/10-bit lookups.  RX-1A needs the message codec
+// boundary itself, so use a complete host-only hash stub here.
+static std::map<uint32_t, std::string> g_hash22;
+static std::map<uint32_t, std::string> g_hash12;
+static std::map<uint32_t, std::string> g_hash10;
+
+static void rx1a_hash_clear()
+{
+    g_hash22.clear();
+    g_hash12.clear();
+    g_hash10.clear();
+}
+
+static bool rx1a_hash_lookup(ftx_callsign_hash_type_t hash_type,
+                             uint32_t hash, char* callsign)
+{
+    const std::map<uint32_t, std::string>* table = nullptr;
+    switch (hash_type)
+    {
+    case FTX_CALLSIGN_HASH_22_BITS: table = &g_hash22; break;
+    case FTX_CALLSIGN_HASH_12_BITS: table = &g_hash12; break;
+    case FTX_CALLSIGN_HASH_10_BITS: table = &g_hash10; break;
+    default: return false;
+    }
+
+    const auto it = table->find(hash);
+    if (it == table->end())
+        return false;
+
+    std::strncpy(callsign, it->second.c_str(), 11);
+    callsign[11] = '\0';
+    return true;
+}
+
+static void rx1a_hash_save(const char* callsign, uint32_t n22)
+{
+    const std::string value(callsign);
+    n22 &= 0x003FFFFFu;
+    g_hash22[n22] = value;
+    g_hash12[(n22 >> 10) & 0x0FFFu] = value;
+    g_hash10[(n22 >> 12) & 0x03FFu] = value;
+}
+
+static ftx_callsign_hash_interface_t g_rx1a_hash_if = {
+    .lookup_hash = rx1a_hash_lookup,
+    .save_hash = rx1a_hash_save,
+};
 
 static uint64_t fnv1a64(const void* data, size_t len)
 {
@@ -158,7 +209,7 @@ static int dump_monitor_decode_case(const char* filename, ftx_protocol_t proto)
             filename, kCandidateCapacity, kMinScore);
     }
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     std::vector<std::array<uint8_t, FTX_PAYLOAD_LENGTH_BYTES>> unique_payloads;
 
     for (int i = 0; i < num_candidates; ++i)
@@ -186,7 +237,7 @@ static int dump_monitor_decode_case(const char* filename, ftx_protocol_t proto)
         char text[FTX_MAX_MESSAGE_LENGTH]{};
         ftx_message_offsets_t offsets{};
         const ftx_message_rc_t rc = ftx_message_decode(
-            &msg, decode_get_hash_if(), text, &offsets);
+            &msg, &g_rx1a_hash_if, text, &offsets);
         char hex[FTX_PAYLOAD_LENGTH_BYTES * 2 + 1];
         payload_hex(msg, hex);
         const ftx_message_type_t type = ftx_message_get_type(&msg);
@@ -222,7 +273,7 @@ static void dump_codec_result(const char* label, const ftx_message_t& msg)
     char text[FTX_MAX_MESSAGE_LENGTH]{};
     ftx_message_offsets_t offsets{};
     const ftx_message_rc_t rc = ftx_message_decode(
-        &msg, decode_get_hash_if(), text, &offsets);
+        &msg, &g_rx1a_hash_if, text, &offsets);
     const ftx_message_type_t type = ftx_message_get_type(&msg);
 
     std::printf(
@@ -243,30 +294,30 @@ static int dump_codec_vectors()
     ftx_message_t msg{};
     ftx_message_rc_t rc;
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     ftx_message_init(&msg);
-    rc = ftx_message_encode_std(&msg, decode_get_hash_if(), "CQ", "W1XYZ", "FN42");
+    rc = ftx_message_encode_std(&msg, &g_rx1a_hash_if, "CQ", "W1XYZ", "FN42");
     if (rc == FTX_MESSAGE_RC_OK) dump_codec_result("standard_cq", msg); else ++failures;
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     ftx_message_init(&msg);
     rc = ftx_message_encode_arrl_fd(
-        &msg, decode_get_hash_if(), "W6ABC", "AG6AQ", "R 1B SCV");
+        &msg, &g_rx1a_hash_if, "W6ABC", "AG6AQ", "R 1B SCV");
     if (rc == FTX_MESSAGE_RC_OK) dump_codec_result("arrl_fd", msg); else ++failures;
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     ftx_message_init(&msg);
     rc = ftx_message_encode_dxpedition(
-        &msg, decode_get_hash_if(), "K1ABC RR73; W9XYZ KH1/KH7Z -08");
+        &msg, &g_rx1a_hash_if, "K1ABC RR73; W9XYZ KH1/KH7Z -08");
     if (rc == FTX_MESSAGE_RC_OK) dump_codec_result("dxpedition", msg); else ++failures;
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     ftx_message_init(&msg);
     rc = ftx_message_encode_nonstd(
-        &msg, decode_get_hash_if(), "CQ", "PJ4/KA1ABC", "");
+        &msg, &g_rx1a_hash_if, "CQ", "PJ4/KA1ABC", "");
     if (rc == FTX_MESSAGE_RC_OK) dump_codec_result("nonstd_cq", msg); else ++failures;
 
-    decode_clear_hashes();
+    rx1a_hash_clear();
     ftx_message_init(&msg);
     rc = ftx_message_encode_free(&msg, "CQ POTA W1XYZ");
     if (rc == FTX_MESSAGE_RC_OK) dump_codec_result("free_text_cq_shape", msg); else ++failures;
