@@ -1,0 +1,28 @@
+name: RX-1A Reference Boundaries
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tests/tx_e2e/rx1a_reference_dump.cpp"
+      - "tests/tx_e2e/CMakeLists.txt"
+      - ".github/workflows/rx1a-reference.yml"
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure host tests
+        run: cmake -S tests/tx_e2e -B build/rx1a -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build reference dumper and golden RX test
+        run: cmake --build build/rx1a --target rx1a_reference_dump test_golden_rx -j2
+
+      - name: Existing golden RX sanity check
+        run: ctest --test-dir build/rx1a -R '^golden_rx$' --output-on-failure
+
+      - name: Dump RX-1A boundary reference
+        run: ./build/rx1a/rx1a_reference_dump
