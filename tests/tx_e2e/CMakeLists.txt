@@ -60,8 +60,6 @@ else()
     target_link_libraries(test_l1 PRIVATE ft8_lib m)
 endif()
 
-
-
 # L2 State Machine Test
 add_executable(test_l2 test_l2_state_machine.cpp tx_state_machine.cpp decode_helper.cpp)
 target_include_directories(test_l2 PRIVATE ${CMAKE_SOURCE_DIR})
@@ -103,7 +101,7 @@ else()
 endif()
 
 # RX-1A reference boundary dumper.  This is intentionally not a ctest target:
-# it exists to freeze reference values at a pinned V2 algorithm baseline.
+# it exists to inspect/reference values at a pinned V2 algorithm baseline.
 add_executable(rx1a_reference_dump rx1a_reference_dump.cpp decode_helper.cpp)
 target_include_directories(rx1a_reference_dump PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(rx1a_reference_dump PRIVATE "RX1A_GOLDEN_DIR=\"${CMAKE_SOURCE_DIR}/golden\"")
@@ -112,6 +110,17 @@ if(WIN32)
     target_link_libraries(rx1a_reference_dump PRIVATE ft8_lib)
 else()
     target_link_libraries(rx1a_reference_dump PRIVATE ft8_lib m)
+endif()
+
+# RX-1A hard regression anchors: monitor waterfall, valid payload, codec type/text.
+add_executable(test_rx1a_boundaries test_rx1a_boundaries.cpp decode_helper.cpp)
+target_include_directories(test_rx1a_boundaries PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_rx1a_boundaries PRIVATE "RX1A_GOLDEN_DIR=\"${CMAKE_SOURCE_DIR}/golden\"")
+target_compile_options(test_rx1a_boundaries PRIVATE -Wno-format)
+if(WIN32)
+    target_link_libraries(test_rx1a_boundaries PRIVATE ft8_lib)
+else()
+    target_link_libraries(test_rx1a_boundaries PRIVATE ft8_lib m)
 endif()
 
 # TA command format test
@@ -158,5 +167,6 @@ add_test(NAME l2_state_machine   COMMAND test_l2)
 add_test(NAME l3_poll_timing     COMMAND test_l3)
 add_test(NAME l4_timer_isolation COMMAND test_l4)
 add_test(NAME golden_rx          COMMAND test_golden_rx)
+add_test(NAME rx1a_boundaries    COMMAND test_rx1a_boundaries)
 add_test(NAME ta_format          COMMAND test_ta_format)
 add_test(NAME kh1_tone_map       COMMAND test_kh1_tone_map)
