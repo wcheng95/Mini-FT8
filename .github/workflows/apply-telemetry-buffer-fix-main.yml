@@ -1,0 +1,38 @@
+name: Apply telemetry buffer safety patch
+
+on:
+  push:
+    paths:
+      - ".github/workflows/apply-telemetry-buffer-fix-main.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/telemetry-buffer
+          fetch-depth: 0
+
+      - name: Apply isolated safety fix to branch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('components/ft8_lib/ft8/message.c')
+          s = p.read_text()
+          old = '    char field1_buf[16];\n'
+          new = ('    // Telemetry renders 18 hex characters plus the terminating NUL.\n'
+                 '    char field1_buf[19];\n')
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one field1_buf[16], found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components/ft8_lib/ft8/message.c
+          git commit -m "fix: prevent telemetry decode buffer overflow"
+          git push origin HEAD:fix/telemetry-buffer
