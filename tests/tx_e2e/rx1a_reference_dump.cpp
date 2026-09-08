@@ -274,7 +274,7 @@ static int dump_codec_vectors()
     // Document the V2 type-0.6 classification gap without treating it as a
     // golden target.  n3 occupies payload bits 71..73; i3 remains zero.
     ftx_message_t gap{};
-    gap.payload[8] = 0x80; // n3 bit 2 = 1
+    gap.payload[8] = 0x01; // n3 bit 2 = 1 (payload bit 71)
     gap.payload[9] = 0x80; // n3 bits 1..0 = 2 -> n3 == 6, i3 == 0
     std::printf("RX1A_KNOWN_GAP case=type_0_6 i3=%u n3=%u get_type=%s(%d) expected_future=CONTESTING\n",
                 static_cast<unsigned>(ftx_message_get_i3(&gap)),
