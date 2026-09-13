@@ -5278,7 +5278,14 @@ static bool storage_is_mounted() {
 static esp_err_t mount_storage() {
   if (storage_is_mounted()) return ESP_OK;
   esp_vfs_fat_mount_config_t mount_config = {};
-  mount_config.format_if_mount_failed = true;
+  // NEVER auto-format. On 2026-09-13 a mount failure after a routine reflash
+  // silently reformatted this partition and destroyed a day's POTA logs.
+  // f_mkfs leaves the data clusters intact but wipes the directory and FAT,
+  // and the next boot's writes start overwriting them. A node that cannot
+  // mount its storage must say so and run without it; the operator recovers
+  // the raw partition (tools/dump_storage.sh + tools/carve_storage.py) and
+  // formats deliberately, from MSC mode, if that is really what they want.
+  mount_config.format_if_mount_failed = false;
   // Mini-FT8 only ever has one or two files open at once (Station.txt,
   // a daily log). Drop max_files from the prior 5 → 3 for a small
   // additional saving — pairs with CONFIG_FATFS_PER_FILE_CACHE=n in
@@ -5299,6 +5306,13 @@ static esp_err_t mount_storage() {
   wl_handle_t handle = WL_INVALID_HANDLE;
   esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
       "/storage", "storage", &mount_config, &handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "STORAGE MOUNT FAILED (%s) — NOT formatting. Logs are still on "
+             "flash: dump 0x190000..0x290000 with tools/dump_storage.sh before "
+             "doing anything else.", esp_err_to_name(err));
+    debug_log_line("STORAGE MOUNT FAILED - not formatting");
+    debug_log_line("dump flash before any reboot");
+  }
   if (err == ESP_OK) {
     s_storage_wl_handle = handle;
     // Boot diagnostic: what the worked-QSO listing (BLE log_days and the
