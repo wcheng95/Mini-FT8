@@ -38,7 +38,7 @@ from collections import defaultdict
 
 BLOCK = 4096
 
-RT_LINE   = re.compile(rb'^([TRQ]) \[(\d{8}) (\d{6})\]\[(\d+\.\d{3})\] (.*)$')
+RT_LINE   = re.compile(rb'^([TRQL]) \[(\d{8}) (\d{6})\]\[(\d+\.\d{3})\] (.*)$')
 ADIF_REC  = re.compile(rb'<call:\d+>.*?<eor>', re.DOTALL | re.IGNORECASE)
 ADIF_DATE = re.compile(rb'<qso_date:\d+>(\d{8})', re.IGNORECASE)
 ADIF_TIME = re.compile(rb'<time_on:\d+>(\d{6})', re.IGNORECASE)
@@ -113,22 +113,39 @@ def main(dump_path: str, out_dir: str) -> int:
           f'station lines: {len(station)}')
     print(f'fragments: {len(tails)} tails, {len(heads)} heads')
 
-    # Re-join cluster-straddling lines: try every tail+head pair.
-    joined = 0
-    for t in tails:
-        for h in heads:
-            cand = t + h
-            if RT_LINE.match(cand):
-                rt_lines[cand] = RT_LINE.match(cand).groups()[1:3] + \
-                                 (RT_LINE.match(cand).group(1), RT_LINE.match(cand).group(5))
-                joined += 1
-            m = ADIF_REC.search(cand)
-            if m and m.group(0) not in adif_recs:
-                rec = m.group(0)
-                d = ADIF_DATE.search(rec); tt = ADIF_TIME.search(rec)
-                adif_recs[rec] = (d.group(1) if d else b'00000000',
-                                  tt.group(1) if tt else b'000000')
-                joined += 1
+    # Re-join cluster-straddling lines. A tail is the unterminated end of a
+    # block, a head the line-less start of another; concatenating the right
+    # pair restores the line. Only unambiguous pairs are accepted — a tail
+    # like "R [20260906 0048" would "validate" against many heads — so a
+    # tail must match exactly one head and that head exactly one tail.
+    def parses(cand):
+        return RT_LINE.match(cand) is not None or ADIF_REC.search(cand) is not None
+    matches = {ti: [hi for hi, h in enumerate(heads) if parses(t + h)]
+               for ti, t in enumerate(tails)}
+    head_hits = defaultdict(list)
+    for ti, hs in matches.items():
+        for hi in hs:
+            head_hits[hi].append(ti)
+    joined = ambiguous = 0
+    for ti, hs in matches.items():
+        if len(hs) != 1 or len(head_hits[hs[0]]) != 1:
+            if hs: ambiguous += 1
+            continue
+        cand = tails[ti] + heads[hs[0]]
+        m = RT_LINE.match(cand)
+        if m:
+            kind, date, time, freq, rest = m.groups()
+            rt_lines[cand] = (date, time, kind, rest)
+            joined += 1
+            continue
+        m = ADIF_REC.search(cand)
+        if m and m.group(0) not in adif_recs:
+            rec = m.group(0)
+            d = ADIF_DATE.search(rec); tt = ADIF_TIME.search(rec)
+            adif_recs[rec] = (d.group(1) if d else b'00000000',
+                              tt.group(1) if tt else b'000000')
+            joined += 1
+    print(f'ambiguous fragment pairs left unjoined: {ambiguous}')
     print(f'rejoined across clusters: {joined}')
 
     os.makedirs(out_dir, exist_ok=True)
