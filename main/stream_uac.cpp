@@ -35,7 +35,10 @@ extern int g_time_osr;
 extern int g_freq_osr;
 extern int64_t g_decode_slot_idx;
 extern volatile bool g_decode_in_progress;
-extern volatile int64_t g_decode_applied_slot_idx;
+// g_decode_applied_slot_idx is owned by the main loop now (core_api_internal.h
+// autoseq owner); this task reports lost slots instead of writing it.
+#include "core_api_internal.h"
+static constexpr int kMinDecodeBlocks = 72;
 extern volatile bool g_cdc_initial_sync_pending;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 int64_t rtc_now_ms();
@@ -790,11 +793,26 @@ static void stream_uac_task(void* arg) {
                     ESP_LOGI(TAG, "Slot boundary %lld->%lld blocks=%d wf=%d",
                              (long long)slot_idx, (long long)now_idx,
                              slot_blocks, mon.wf.num_blocks);
-                    // The slot that just ended (slot_idx) is considered "applied"
-                    // whether we decoded it or not — we're moving past it either
-                    // way, so subsequent TX slots shouldn't block waiting for it.
-                    if (slot_idx > g_decode_applied_slot_idx) {
-                        g_decode_applied_slot_idx = slot_idx;
+                    // A slot ending short of 79 blocks means this task was busy
+                    // elsewhere — decoding the previous slot (and, until the
+                    // logger task, writing its log lines to flash). Decode it
+                    // anyway if the payload symbols are all there: FT8 carries
+                    // its 174 payload bits in symbols 7-35 and 43-71; 72-78 are
+                    // only the third sync array, so >= 72 blocks decodes nearly
+                    // as well as a full slot. Discarding it — and silently
+                    // advancing the TX gate here — is how RT260913 (Pismo)
+                    // transmitted a retry over the other station's response.
+                    if (g_decode_enabled && mon.wf.num_blocks >= kMinDecodeBlocks &&
+                        mon.wf.num_blocks < 79) {
+                        ESP_LOGW(TAG, "Short slot %lld: decoding %d/79 blocks",
+                                 (long long)slot_idx, mon.wf.num_blocks);
+                        g_decode_slot_idx = slot_idx;
+                        g_decode_in_progress = true;
+                        decode_monitor_results(&mon, &mon_cfg, false);
+                    } else if (mon.wf.num_blocks < 79) {
+                        // Nothing decodable. The owner advances the TX gate
+                        // and logs it — not done here, not in silence.
+                        autoseq_owner_post_slot_lost(slot_idx, mon.wf.num_blocks);
                     }
                     // Reset counters at the boundary
                     slot_idx = now_idx;
@@ -814,11 +832,9 @@ static void stream_uac_task(void* arg) {
                         // both updated at the end of decode_monitor_results.
                     } else {
                         ESP_LOGI(TAG, "Decode paused; skipping");
-                        // Decode disabled — still mark as applied so TX isn't
-                        // blocked waiting for a decode that won't happen.
-                        if (slot_idx > g_decode_applied_slot_idx) {
-                            g_decode_applied_slot_idx = slot_idx;
-                        }
+                        // Decode disabled — the owner still has to advance the
+                        // TX gate past this slot, or TX blocks forever.
+                        autoseq_owner_post_slot_lost(slot_idx, -1);
                     }
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;

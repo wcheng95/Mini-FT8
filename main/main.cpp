@@ -585,18 +585,6 @@ static esp_err_t ensure_sdcard_mounted() {
   return ESP_FAIL;
 }
 
-static void build_rxtx_log_path(char* path, size_t path_sz) {
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-
-  // RT[YYMMDD].txt
-  snprintf(path, path_sz, "/storage/RT%02d%02d%02d.txt",
-           (t.tm_year + 1900) % 100,
-           (t.tm_mon + 1) % 100,
-           t.tm_mday % 100);
-}
-
 static bool file_exists(const char* path) {
   struct stat st;
   return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
@@ -1471,57 +1459,117 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
 static inline void log_heap(const char*) {}
 #endif
 
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
-  if (!g_rxtx_log) return;
-  if (!log_mutex) return;  // Not initialized yet
+// ---------------------------------------------------------------------------
+// RxTx log writer task.
+//
+// Every log line used to be an fopen/fprintf/fclose on FATFS over
+// wear-levelled flash, on whichever task produced it — and each one is an
+// erase-before-write of a 4 KB sector, 100-200 ms. On a busy band the decode
+// path wrote 20+ R lines per slot: seconds of flash I/O inside the capture
+// loop, during which no audio was captured, so the next slot came up short
+// and was discarded at the boundary (RT260913, Pismo). Lines are now
+// formatted at the call site — timestamp taken then — and queued as fixed-
+// size records (no heap from the decode task); this task appends them.
+// ---------------------------------------------------------------------------
+struct RtLogRec { char line[160]; };
+static constexpr int kRtLogQueueLen = 48;
+static QueueHandle_t s_rtlog_q = nullptr;
+static StaticQueue_t s_rtlog_qbuf;
+static uint8_t       s_rtlog_qstore[kRtLogQueueLen * sizeof(RtLogRec)];
+static volatile uint32_t s_rtlog_dropped = 0;
 
-  // Prepare log line outside mutex
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-  char ts[32];
-  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec);
-  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
-
-  char log_path[64];
-  build_rxtx_log_path(log_path, sizeof(log_path));
-
-  // Take mutex for file access
-  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+static void rtlog_write_now(const RtLogRec& r) {
+  if (!log_mutex) return;
+  // Path from the line's own date ("T [20260913 ...") so a line queued just
+  // before midnight lands in the day it belongs to, not the day it's written.
+  const char* d = r.line + 3;   // YYYYMMDD
+  char path[64];
+  snprintf(path, sizeof(path), "/storage/RT%c%c%c%c%c%c.txt",
+           d[2], d[3], d[4], d[5], d[6], d[7]);
+  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
     ESP_LOGW(TAG, "RxTxLog mutex timeout");
     return;
   }
-
-  FILE* f = fopen(log_path, "a");
-  if (!f) {
-    ESP_LOGW(TAG, "RxTxLog open failed: %s", log_path);
-    xSemaphoreGive(log_mutex);
-    return;
-  }
-
-  // For TX, omit SNR and repeat; for RX keep SNR.
-  if (dir == 'T') {
-    fprintf(f, "%c [%s][%.3f] %s %d\n",
-            dir, ts, freq_mhz, text.c_str(), offset_hz);
+  FILE* f = fopen(path, "a");
+  if (f) {
+    fputs(r.line, f);
+    fputc('\n', f);
+    fclose(f);
   } else {
-    fprintf(f, "%c [%s][%.3f] %s %d %d\n",
-            dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+    ESP_LOGW(TAG, "RxTxLog open failed: %s", path);
   }
-
-  fclose(f);
   xSemaphoreGive(log_mutex);
 }
 
-// Queue snapshot into the RxTx log, one "Q" line per context — the habit
-// DXFT8 had and this port dropped. Written after every autoseq mutation
-// point, so a wedged queue shows up in the log directly instead of having to
-// be reconstructed from T/R lines, which is how RT260828's 18-minute silence
-// had to be diagnosed. Field key in autoseq.h (autoseq_get_queue_log_lines).
-static void log_queue_lines() {
-  if (!g_rxtx_log || !log_mutex) return;
+static void rtlog_task(void*) {
+  RtLogRec r;
+  uint32_t reported_drops = 0;
+  while (true) {
+    if (xQueueReceive(s_rtlog_q, &r, portMAX_DELAY) == pdTRUE) {
+      if (g_rxtx_log && storage_is_mounted()) rtlog_write_now(r);
+      const uint32_t d = s_rtlog_dropped;
+      if (d != reported_drops) {
+        ESP_LOGW(TAG, "RxTxLog dropped %u line(s) — queue full", (unsigned)(d - reported_drops));
+        reported_drops = d;
+      }
+    }
+  }
+}
 
+static void rtlog_init() {
+  s_rtlog_q = xQueueCreateStatic(kRtLogQueueLen, sizeof(RtLogRec),
+                                 s_rtlog_qstore, &s_rtlog_qbuf);
+  xTaskCreatePinnedToCore(rtlog_task, "rtlog", 4096, nullptr, 2, nullptr, 0);
+}
+
+// Never blocks the caller. A full queue drops the line and counts it; the
+// decode and main loops must not stall behind flash.
+static void rtlog_enqueue(const char* line) {
+  if (!s_rtlog_q) return;
+  RtLogRec r;
+  strlcpy(r.line, line, sizeof(r.line));
+  if (xQueueSend(s_rtlog_q, &r, 0) != pdTRUE) s_rtlog_dropped = s_rtlog_dropped + 1;
+}
+
+// Wait for queued lines to reach flash — before unmounting for MSC, so the
+// last slot's lines are on the volume the operator is about to read.
+static void rtlog_flush(TickType_t max_wait) {
+  if (!s_rtlog_q) return;
+  const TickType_t deadline = xTaskGetTickCount() + max_wait;
+  while (uxQueueMessagesWaiting(s_rtlog_q) > 0 && xTaskGetTickCount() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  vTaskDelay(pdMS_TO_TICKS(50));   // let an in-flight fclose land
+}
+
+static void rtlog_stamp(char* ts, size_t ts_sz, double* freq_mhz) {
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t;
+  localtime_r(&now, &t);
+  snprintf(ts, ts_sz, "%04d%02d%02d %02d%02d%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+  *freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+}
+
+static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
+  if (!g_rxtx_log) return;
+  char ts[32]; double freq_mhz;
+  rtlog_stamp(ts, sizeof(ts), &freq_mhz);
+  char line[160];
+  // For TX, omit SNR and repeat; for RX keep SNR.
+  if (dir == 'T') {
+    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d",
+             dir, ts, freq_mhz, text.c_str(), offset_hz);
+  } else {
+    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d %d",
+             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
+  }
+  rtlog_enqueue(line);
+}
+
+static void log_queue_lines() {
+  if (!g_rxtx_log) return;
   std::vector<std::string> lines;
   autoseq_get_queue_log_lines(lines);
 
@@ -1530,29 +1578,18 @@ static void log_queue_lines() {
   if (lines.empty() && last_n == 0) return;
   last_n = lines.size();
 
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-  char ts[32];
-  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec);
-  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
-
-  char log_path[64];
-  build_rxtx_log_path(log_path, sizeof(log_path));
-
-  if (xSemaphoreTake(log_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-  FILE* f = fopen(log_path, "a");
-  if (f) {
-    if (lines.empty()) {
-      fprintf(f, "Q [%s][%.3f] -\n", ts, freq_mhz);
-    } else {
-      for (const auto& l : lines) fprintf(f, "Q [%s][%.3f] %s\n", ts, freq_mhz, l.c_str());
+  char ts[32]; double freq_mhz;
+  rtlog_stamp(ts, sizeof(ts), &freq_mhz);
+  char line[160];
+  if (lines.empty()) {
+    snprintf(line, sizeof(line), "Q [%s][%.3f] -", ts, freq_mhz);
+    rtlog_enqueue(line);
+  } else {
+    for (const auto& l : lines) {
+      snprintf(line, sizeof(line), "Q [%s][%.3f] %s", ts, freq_mhz, l.c_str());
+      rtlog_enqueue(line);
     }
-    fclose(f);
   }
-  xSemaphoreGive(log_mutex);
 }
 
 static void qso_load_file_list() {
@@ -2690,7 +2727,7 @@ void arm_pending_tx(const AutoseqTxEntry& pending) {
 // armed-TX state. Everyone else posts here. See core_api_internal.h.
 // ---------------------------------------------------------------------------
 struct AutoseqCmd {
-  enum Kind : uint8_t { DECODES, TOUCH, CLEAR, DROP, FREETEXT, CONFIG, SKIP_TX1, MAX_RETRY };
+  enum Kind : uint8_t { DECODES, SLOT_LOST, TOUCH, CLEAR, DROP, FREETEXT, CONFIG, SKIP_TX1, MAX_RETRY };
   Kind                  kind;
   std::vector<UiRxLine> decodes;        // DECODES
   int64_t               slot_idx = -1;  // DECODES: the RX slot these came from
@@ -2743,6 +2780,10 @@ void autoseq_owner_post_skip_tx1(bool skip) {
 }
 void autoseq_owner_post_max_retry(int n) {
   auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::MAX_RETRY; c->ival = n; owner_post(c);
+}
+void autoseq_owner_post_slot_lost(int64_t slot_idx, int blocks) {
+  auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::SLOT_LOST;
+  c->slot_idx = slot_idx; c->ival = blocks; owner_post(c);
 }
 static void autoseq_owner_post_decodes(std::vector<UiRxLine>&& to_me, int64_t slot_idx) {
   auto* c = new AutoseqCmd{}; c->kind = AutoseqCmd::DECODES;
@@ -2821,6 +2862,21 @@ static void autoseq_owner_drain() {
       case AutoseqCmd::DECODES:
         autoseq_owner_apply_decodes(c->decodes, c->slot_idx);
         break;
+      case AutoseqCmd::SLOT_LOST: {
+        // An RX slot went undecoded (capture came up short, or decode was
+        // paused). The TX gate advances — we're past that slot either way —
+        // but deliberately, here, and on the log: a retry that follows this
+        // line went out without hearing the other side, and that is what
+        // the operator needs to see when a QSO looks wrong.
+        if (c->slot_idx > g_decode_applied_slot_idx) g_decode_applied_slot_idx = c->slot_idx;
+        char ts[32]; double freq_mhz; char line[160];
+        rtlog_stamp(ts, sizeof(ts), &freq_mhz);
+        snprintf(line, sizeof(line), "L [%s][%.3f] slot %lld not decoded (%d/79 blocks)",
+                 ts, freq_mhz, (long long)c->slot_idx, c->ival);
+        rtlog_enqueue(line);
+        ESP_LOGW(TAG, "%s", line);
+        break;
+      }
       case AutoseqCmd::TOUCH: {
         autoseq_on_touch(c->msg);
         // Arm now so the pick is honoured at the next matching boundary
@@ -5349,6 +5405,7 @@ static esp_err_t mount_storage() {
 }
 
 static void unmount_storage() {
+  rtlog_flush(pdMS_TO_TICKS(3000));
   if (!storage_is_mounted()) return;
   esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
   s_storage_wl_handle = WL_INVALID_HANDLE;
@@ -5362,6 +5419,7 @@ static void app_task_core0(void* /*param*/) {
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
+  rtlog_init();
 
   ui_init();
   hashtable_init();

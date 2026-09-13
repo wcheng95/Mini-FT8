@@ -54,6 +54,9 @@ void autoseq_owner_post_freetext(const std::string& text);
 void autoseq_owner_post_config(AutoseqOwnerCfg what);
 void autoseq_owner_post_skip_tx1(bool skip);
 void autoseq_owner_post_max_retry(int n);
+// Capture task: an RX slot ended without a decode (short capture / paused).
+// The owner advances the TX gate past it and logs an "L" line.
+void autoseq_owner_post_slot_lost(int64_t slot_idx, int blocks);
 
 // Read-only snapshot published by the owner whenever autoseq changes.
 // This is what other tasks read instead of autoseq itself.
