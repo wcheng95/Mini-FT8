@@ -1218,7 +1218,7 @@ static void poll_uart_inject_keys() {
   if (!s_key_inject_queue || !g_debug_uart_pins_enabled) return;
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
-  // pins TX=G4, RX=G5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
+  // pins TX=G3, RX=G6 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
   // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
   // UART1 peripheral on GPIO1 — no conflict.
   uart_dev_t *hw = UART_LL_GET_HW(0);
@@ -1329,7 +1329,7 @@ static void apply_debug_uart_pin_policy() {
     uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_inject_last_was_cr = false;
     g_debug_uart_pins_enabled = true;
-    ESP_LOGI(TAG, "G4/G5 debug UART enabled");
+    ESP_LOGI(TAG, "G3/G6 debug UART enabled");
   } else {
     if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
     uart_inject_last_was_cr = false;
@@ -1340,7 +1340,7 @@ static void apply_debug_uart_pin_policy() {
     set_gpio_floating_input(rx);
     const bool changed = g_debug_uart_pins_enabled;
     g_debug_uart_pins_enabled = false;
-    if (changed) ESP_LOGI(TAG, "G4/G5 debug UART disabled for GNSS LoRa");
+    if (changed) ESP_LOGI(TAG, "G3/G6 debug UART disabled for GNSS LoRa");
   }
 }
 
@@ -4708,7 +4708,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     } else if (state.enter) {
       c = '\n';  // enter/return
     }
-    // Merge injected keys from console UART RX (G4/G5 per sdkconfig)
+    // Merge injected keys from console UART RX (G3/G6 per sdkconfig)
     poll_uart_inject_keys();
     if (c == 0 && s_key_inject_queue && g_debug_uart_pins_enabled) {
       char injected = 0;
