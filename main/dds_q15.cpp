@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <math.h>
+#include <string.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -113,28 +114,22 @@ static inline int16_t sin_q15_from_phase(uint64_t phase) {
     return static_cast<int16_t>(sample);
 }
 
-static inline void emit_stereo_frame(uint8_t* out, int16_t sample_q15) {
-    int32_t sample_24 = static_cast<int32_t>(sample_q15) << 8;
-    uint8_t b0 = static_cast<uint8_t>(sample_24 & 0xFF);
-    uint8_t b1 = static_cast<uint8_t>((sample_24 >> 8) & 0xFF);
-    uint8_t b2 = static_cast<uint8_t>((sample_24 >> 16) & 0xFF);
-    out[0] = b0;
-    out[1] = b1;
-    out[2] = b2;
-    out[3] = b0;
-    out[4] = b1;
-    out[5] = b2;
-}
-
-static inline void emit_silence(uint8_t*& out, unsigned frames) {
-    while (frames-- > 0) {
-        out[0] = out[1] = out[2] = 0;
-        out[3] = out[4] = out[5] = 0;
-        out += 6;
+// Writes one PCM frame (same sample on every channel), little-endian.
+static inline void emit_frame(uint8_t* out, int16_t sample_q15,
+                              unsigned bytes_per_sample, unsigned channels) {
+    int32_t sample = static_cast<int32_t>(sample_q15);
+    if (bytes_per_sample == 3) sample <<= 8;
+    for (unsigned ch = 0; ch < channels; ++ch) {
+        for (unsigned b = 0; b < bytes_per_sample; ++b) {
+            *out++ = static_cast<uint8_t>((sample >> (8 * b)) & 0xFF);
+        }
     }
 }
 
-void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
+void dds_render_pcm(uint8_t* out, unsigned frames,
+                    unsigned bit_resolution, unsigned channels) {
+    const unsigned bytes_per_sample = bit_resolution / 8;
+    const unsigned frame_bytes = bytes_per_sample * channels;
     uint64_t phase = s_phase;
 
     if (s_cpfsk_active.load(std::memory_order_acquire)) {
@@ -145,7 +140,7 @@ void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
 
         while (frames > 0) {
             if (counter >= total_samples) {
-                emit_silence(out, frames);
+                memset(out, 0, static_cast<size_t>(frames) * frame_bytes);
                 frames = 0;
                 break;
             }
@@ -160,8 +155,8 @@ void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
             s_inc.store(increment, std::memory_order_relaxed);
 
             for (unsigned i = 0; i < render_count; ++i) {
-                emit_stereo_frame(out, sin_q15_from_phase(phase));
-                out += 6;
+                emit_frame(out, sin_q15_from_phase(phase), bytes_per_sample, channels);
+                out += frame_bytes;
                 phase += increment;
             }
             counter += render_count;
@@ -175,9 +170,13 @@ void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
 
     uint64_t increment = s_inc.load(std::memory_order_relaxed);
     for (unsigned n = 0; n < frames; ++n) {
-        emit_stereo_frame(out, sin_q15_from_phase(phase));
-        out += 6;
+        emit_frame(out, sin_q15_from_phase(phase), bytes_per_sample, channels);
+        out += frame_bytes;
         phase += increment;
     }
     s_phase = phase;
+}
+
+void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
+    dds_render_pcm(out, frames, 24, 2);
 }

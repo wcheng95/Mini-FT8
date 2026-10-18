@@ -11,6 +11,8 @@ typedef enum {
     AUDIO_SOURCE_QMX_UAC = 0,
     AUDIO_SOURCE_USB_UAC_GENERIC = 1,
     AUDIO_SOURCE_KH1_MIC = 2,
+    AUDIO_SOURCE_FX4CR_UAC = 3,     // C-Media UAC behind the FX-4CR hub
+    AUDIO_SOURCE_TRUSDX_CAT = 4,    // audio streamed inside truSDX CAT
 } audio_source_backend_t;
 
 void audio_source_set_backend(audio_source_backend_t backend);

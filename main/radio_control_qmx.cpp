@@ -129,6 +129,7 @@ static const radio_control_ops_t k_ops = {
     .end_tx = qmx_end_tx,
     .set_tune = qmx_set_tune,
     .set_time = qmx_set_time,
+    .start_tx_waveform = nullptr,
 };
 
 const radio_control_ops_t* radio_control_qmx_get_ops(void) {

@@ -345,6 +345,7 @@ static const radio_control_ops_t k_ops = {
     .end_tx = kh1_end_tx,
     .set_tune = kh1_set_tune,
     .set_time = nullptr,
+    .start_tx_waveform = nullptr,
 };
 
 const radio_control_ops_t* radio_control_kh1_get_ops(void) {

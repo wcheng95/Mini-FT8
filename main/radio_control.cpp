@@ -14,6 +14,10 @@ static const radio_control_ops_t* current_ops(void) {
         return radio_control_kh1_get_ops();
     case RADIO_CONTROL_QDX:
         return radio_control_qdx_get_ops();
+    case RADIO_CONTROL_FX4CR:
+        return radio_control_fx4cr_get_ops();
+    case RADIO_CONTROL_TRUSDX:
+        return radio_control_trusdx_get_ops();
     case RADIO_CONTROL_QMX:
     default:
         return radio_control_qmx_get_ops();
@@ -38,6 +42,10 @@ const char* radio_control_backend_name(radio_control_backend_t backend) {
         return "kh1_cat";
     case RADIO_CONTROL_QDX:
         return "qdx";
+    case RADIO_CONTROL_FX4CR:
+        return "fx4cr";
+    case RADIO_CONTROL_TRUSDX:
+        return "trusdx";
     default:
         return "unknown";
     }
@@ -89,4 +97,21 @@ esp_err_t radio_control_set_time(int hour, int minute, int second) {
     const radio_control_ops_t* ops = current_ops();
     if (!ops || !ops->set_time) return ESP_ERR_NOT_SUPPORTED;
     return ops->set_time(hour, minute, second);
+}
+
+bool radio_control_uses_tx_waveform(void) {
+    const radio_control_ops_t* ops = current_ops();
+    return ops && ops->start_tx_waveform;
+}
+
+esp_err_t radio_control_start_tx_waveform(float base_hz,
+                                          const uint8_t* symbols,
+                                          size_t symbol_count,
+                                          float tone_spacing_hz,
+                                          float symbol_period_s,
+                                          uint32_t samples_per_symbol_48k) {
+    const radio_control_ops_t* ops = current_ops();
+    if (!ops || !ops->start_tx_waveform) return ESP_ERR_NOT_SUPPORTED;
+    return ops->start_tx_waveform(base_hz, symbols, symbol_count, tone_spacing_hz,
+                                  symbol_period_s, samples_per_symbol_48k);
 }

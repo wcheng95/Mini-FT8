@@ -39,7 +39,7 @@ const char* core_api_version();   // "major.minor.patch"
 enum class CoreBeaconMode : uint8_t { OFF = 0, EVEN = 1, ODD = 2 };
 enum class CoreCqType     : uint8_t { CQ = 0, SOTA, POTA, QRP, FD, FREETEXT };
 enum class CoreOffsetSrc  : uint8_t { RX = 0, CURSOR = 1, RANDOM = 2 };
-enum class CoreRadioType  : uint8_t { QMX = 0, KH1 = 1, QDX = 2 };
+enum class CoreRadioType  : uint8_t { QMX = 0, KH1 = 1, QDX = 2, FX4CR = 3, TRUSDX = 4 };
 
 enum class CoreQsoState : uint8_t {
   CALLING, REPLYING, REPORT, ROGER_REPORT, ROGERS, SIGNOFF, IDLE

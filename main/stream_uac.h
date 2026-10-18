@@ -29,6 +29,9 @@ typedef enum {
 typedef enum {
     UAC_PROFILE_QMX = 0,
     UAC_PROFILE_GENERIC_USB = 1,
+    // FX-4CR: internal hub with a C-Media UAC1 codec plus a USB-serial
+    // bridge (CH34x / CP210x / CDC-ACM) for Kenwood CAT at 115200 baud.
+    UAC_PROFILE_FX4CR = 2,
 } uac_stream_profile_t;
 
 #define UAC_WATERFALL_ROW_WIDTH FT8_AUDIO_WATERFALL_ROW_WIDTH
@@ -46,6 +49,9 @@ const char* uac_get_debug_line2(void);
 bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 bool cat_cdc_ready(void);
+// FX-4CR STATUS text: "CAT none", "CAT seen vvvv:pppp", "CAT vvvv:pppp",
+// "CAT ok vvvv:pppp" after a successful burst, or "CATerr <error>".
+const char* uac_get_cat_status(void);
 esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms);
 
 bool uac_tx_begin_cpfsk(float base_hz,
@@ -55,6 +61,16 @@ bool uac_tx_begin_cpfsk(float base_hz,
                         uint32_t samples_per_symbol);
 bool uac_tx_begin_tune(float tone_hz);
 void uac_tx_end(void);
+// As uac_tx_end(); with resume_rx = false the FX-4CR mic stays paused so a
+// following CAT batch (RX;) can use its host channel.
+void uac_tx_end_ex(bool resume_rx);
+// Send CAT commands as one burst. FX-4CR: pauses the mic, opens the bridge,
+// sends, closes it; resume_rx restarts the mic afterwards. Others: plain send.
+esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx);
+// urgent = true ignores the failure back-off (used for RX; to unkey).
+esp_err_t uac_cat_batch_ex(const char* const* cmds, size_t count, bool resume_rx, bool urgent);
+// Restart an FX-4CR mic paused for TX / CAT (no-op if not paused).
+void uac_rx_resume(void);
 
 #ifdef __cplusplus
 }

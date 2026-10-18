@@ -153,10 +153,14 @@ CoreRadioType map_out(RadioType r) {
   if (r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) {
     return CoreRadioType::KH1;
   }
+  if (r == RadioType::FX4CR) return CoreRadioType::FX4CR;
+  if (r == RadioType::TRUSDX) return CoreRadioType::TRUSDX;
   return (r == RadioType::QDX) ? CoreRadioType::QDX : CoreRadioType::QMX;
 }
 RadioType map_in(CoreRadioType r) {
   if (r == CoreRadioType::KH1) return RadioType::KH1;
+  if (r == CoreRadioType::FX4CR) return RadioType::FX4CR;
+  if (r == CoreRadioType::TRUSDX) return RadioType::TRUSDX;
   return (r == CoreRadioType::QDX) ? RadioType::QDX : RadioType::QMX;
 }
 

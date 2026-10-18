@@ -82,7 +82,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `6` | Enter Sleep. Shows battery info. |
 | `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
-|  | `3` | Select radio (`QMX` / `QDX` / `KH1-USBC` / `KH1-MIC`). |
+|  | `3` | Select radio (`QMX` / `QDX` / `FX-4CR` / `truSDX` / `KH1-USBC` / `KH1-MIC`). |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
@@ -183,3 +183,62 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
 
 - Mini-FT8 automatically sets KH1 TX power to 2 W.
 - For best RX performance, reduce AF volume to `05` or `06`.
+
+## FX-4CR (F5BUD firmware) Connections
+
+The FX-4CR's USB port leads to internal USB hubs. Behind them are a C-Media USB sound card (RX and TX audio),
+a CH340 USB-serial bridge for CAT (Kenwood TS-590S protocol, 115200 baud) and a Bluetooth module.
+
+- Select `FX-4CR` in MENU P2 (`N` -> `3`), then connect with `S` -> `2`.
+- Power the radio from its own 12 V supply (XT60) as usual. The USB port does not power the radio.
+- A USB host must provide 5 V on the cable for the radio's hub, sound card and serial bridge. Supply 5 V from an external source (power bank/adapter) to PORTA and **set the micro switch to the right** (5VIN), the same as for KH1-USBC. The Cardputer passes this 5 V through to USB-C.
+- Use the radio's own USB cable: TRRS-to-USB-A on V/VR units, USB-C on R units. Add a USB-A (female) to USB-C (male) OTG adapter for the Cardputer.
+- Radio settings:
+  - `Digital mode (CAT)` = `DATA` (the default). Mini-FT8 sends `MD2;`, which the F5BUD firmware maps to DATA-U. Only in DATA-L/U does the radio take TX audio from USB.
+  - Mini-FT8 holds RTS and DTR low, so `RTS as PTT` does not key the radio.
+  - Adjust `Aux-Input-Level` / `Aux-Output-Level` (Usb & Bt) for a clean TX signal and a sensible RX level.
+- TX keys with CAT `TX1;` (data send) and plays a 48 kHz FT8/FT4 waveform on the USB sound card, the same as QDX. `RX;` ends the transmission.
+- The ESP32-S3 USB host has only 8 channels, and the radio's hubs and devices permanently use 7 of them. Mini-FT8 therefore takes turns with the last one:
+  - CAT commands are sent in short bursts, at connect, at each band change and at TX start/end. RX audio pauses for a fraction of a second during each burst.
+  - The Bluetooth module's audio device is ignored.
+- STATUS line 2 shows the CAT state: `CAT ok 1a86:7523` after a successful command burst, or `CATerr <error>`. After a failure, retries back off from 3 s up to 60 s, and the automatic sync stops after 3 attempts so RX keeps decoding. Press `S` -> `2` to retry.
+
+```text
+┌───────────────────┐   USB (hub: C-Media audio + serial bridge)   ┌─────────────────────┐
+│ FX-4CR            ├──────────────────────────────────────────────┤ USB-C  Cardputer ADV│
+│                   │                                               │                     │
+└───────────────────┘                   5 V supply ─────────────────┤ PORTA 5V / GND      │
+                                                                    │ SW: 5VIN (Right)    │
+                                                                    └─────────────────────┘
+```
+
+## (tr)uSDX Connections
+
+The (tr)uSDX has no USB sound card. Its Micro-USB port is a CH340G serial bridge to the ATmega. Mini-FT8 uses
+the firmware's **CAT audio streaming**:
+- RX audio arrives as 8-bit samples at about 7.8 kHz inside the CAT link, enabled with `UA2;`, which also mutes the radio speaker.
+- TX audio is sent back as 8-bit samples at 11.52 kHz after `TX0;`.
+
+- Requires truSDX firmware **2.00u or newer**; CAT runs at 115200 baud from 2.00t on.
+- Select `truSDX` in MENU P2 (`N` -> `3`).
+- **Always power the radio from its own 12 V supply.** Without it, the truSDX runs the whole radio from USB 5 V (about 0.5 W out, several hundred mA in TX), and that current would flow through the Cardputer's PORTA and USB-C path.
+- Supply 5 V from an external source to PORTA and **set the micro switch to the right** (5VIN). With 12 V connected, this only feeds the CH340 serial bridge, a few tens of mA.
+- To keep the radio's USB current off the Cardputer entirely, put a self-powered USB hub between the Cardputer and the radio. Hub support is enabled in this build.
+- Cable: Micro-USB (male) to USB-C (male) OTG cable or adapter.
+- After the port opens, Mini-FT8 waits 3 s, because opening the CH340 resets the ATmega. It then sends `MD2;UA2;` and the current band frequency.
+- Radio menu recommendations:
+  - `TX Drive` = `8` (constant amplitude).
+  - Semi-QSK `OFF`.
+  - Calibrate `Ref freq` for accurate frequency.
+- Keep the TX offset between about 200 and 2300 Hz; truSDX TX audio bandwidth is about 2.4 kHz.
+- Decoding works from 8-bit audio, but the dynamic range is only about 46 dB. Keep the RX gain/attenuator so the band noise is not clipping.
+- STATUS line 2 shows `truSDX rx <rate>Hz` once streaming. The RX sample rate is measured continuously; it differs between firmware builds, e.g. about 7936 Hz on 2.00x.
+
+```text
+┌───────────────────┐        Micro-USB (CH340G, CAT + audio)        ┌─────────────────────┐
+│ (tr)uSDX          ├───────────────────────────────────────────────┤ USB-C  Cardputer ADV│
+│                   │                                               │                     │
+└───────────────────┘                   5 V supply ─────────────────┤ PORTA 5V / GND      │
+                                                                    │ SW: 5VIN (Right)    │
+                                                                    └─────────────────────┘
+```

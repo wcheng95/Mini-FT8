@@ -16,7 +16,10 @@
 #include "usb/usb_host.h"
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
+#include "usb/vcp_ch34x.h"
+#include "usb/vcp_cp210x.h"
 #include "usb/usb_types_ch9.h"
+#include "usb/usb_helpers.h"
 
 #include <cstring>
 #include <cmath>
@@ -114,6 +117,26 @@ static int s_cdc_iface_hint = -1;
 static int64_t s_cdc_last_attempt_ms = 0;
 static constexpr uint16_t k_qmx_vid = 0x0483;
 static constexpr uint16_t k_qmx_pid = 0xA34C;
+static constexpr uint32_t k_fx4cr_cat_baud = 115200;
+// FX-4CR: the USB-serial bridge seen behind the radio's hub. Any device
+// with a CDC or vendor-specific interface that is not the audio codec or a
+// hub is a candidate. Opened by exact VID/PID: CDC_HOST_ANY_* behind a hub
+// may pick the codec instead.
+static uint16_t s_vcp_vid = 0;
+static uint16_t s_vcp_pid = 0;
+static int s_vcp_iface = 0;
+static char s_cat_status[32] = "CAT none";  // FX-4CR STATUS line text
+// FX-4CR host channel budget. The ESP32-S3 USB host has 8 channels and
+// ESP-IDF keeps one per open endpoint. The radio has two hubs (control +
+// status each) and three devices (codec, CH340, CSR Bluetooth; one control
+// endpoint each): 7 channels are held permanently, leaving exactly one.
+// So the mic, the speaker and the CAT bridge take turns: CAT is sent in
+// short bursts (uac_cat_batch) with the mic paused, and the bridge is
+// claimed with its bulk OUT endpoint only (fx_ch340_write).
+static bool s_fx_cat_announced = false;
+static int64_t s_cat_fail_ms = 0;   // last failed CAT burst
+static int s_cat_fail_count = 0;    // consecutive failures, for back-off
+static SemaphoreHandle_t s_cat_lock = NULL;
 
 // Debug display buffers
 static char s_debug_line1[64] = "";
@@ -147,7 +170,18 @@ static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
 static const uint32_t SPK_PACKET_BYTES     = 288;       // 48 stereo frames × 6 B
 static const uint32_t SPK_PUMP_PACKETS     = 6;         // 6 packets per write = 1728 B
 static const uint32_t SPK_PUMP_BYTES       = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 1728
-static const uint32_t SPK_FRAME_BYTES      = 6;         // L+R, 24-bit each
+// Negotiated speaker format. QMX/QDX always use 24-bit stereo; the FX-4CR's
+// C-Media codec is 16-bit. SPK_PUMP_BYTES divides evenly by 2, 3, 4 and 6.
+static uint8_t s_spk_bits = 24;
+static uint8_t s_spk_channels = 2;
+// FX-4CR (see the channel budget above): the speaker is only opened at
+// enumeration and claimed per TX. Mic stopped + speaker started at TX
+// begin, the reverse at TX end.
+static bool s_spk_swap_mode = false;
+static bool s_spk_fmt_known = false;
+static volatile bool s_mic_paused = false;
+static volatile bool s_mic_restart_needed = false;  // a restart failed; retry
+static void mic_resume_after_tx(void);
 static void spk_event_cb(uac_host_device_handle_t dev,
                          const uac_host_device_event_t event,
                          void* arg);
@@ -163,6 +197,8 @@ static const char* profile_name(uac_stream_profile_t profile) {
         return "qmx_uac";
     case UAC_PROFILE_GENERIC_USB:
         return "usb_uac_generic";
+    case UAC_PROFILE_FX4CR:
+        return "fx4cr_uac";
     default:
         return "unknown";
     }
@@ -193,6 +229,49 @@ static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_
     default:
         break;
     }
+}
+
+// Profiles whose radio exposes CAT and accepts TX audio over USB.
+static bool profile_has_cat_and_tx_audio(uac_stream_profile_t profile) {
+    return profile == UAC_PROFILE_QMX || profile == UAC_PROFILE_FX4CR;
+}
+
+// Kenwood CAT on the FX-4CR bridge: 115200 8N1. RTS is wired to PTT in the
+// F5BUD firmware ("RTS as PTT"), so both modem lines must stay deasserted.
+static void cdc_configure_fx4cr_line(cdc_acm_dev_hdl_t handle) {
+    cdc_acm_line_coding_t coding = {};
+    coding.dwDTERate = k_fx4cr_cat_baud;
+    coding.bCharFormat = 0;  // 1 stop bit
+    coding.bParityType = 0;  // none
+    coding.bDataBits = 8;
+    esp_err_t err = cdc_acm_host_line_coding_set(handle, &coding);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "FX-4CR CAT line coding failed: %s", esp_err_to_name(err));
+    }
+    err = cdc_acm_host_set_control_line_state(handle, false, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "FX-4CR CAT DTR/RTS clear failed: %s", esp_err_to_name(err));
+    }
+}
+
+static bool is_legacy_ch34x_pid(uint16_t pid) {
+    // CH340/CH341 use vendor requests for baud rate. Newer WCH parts with the
+    // same VID (e.g. CH9102, PID 0x55D4) are CDC-ACM compliant instead.
+    return pid == CH340_PID || pid == CH340_PID_1 || pid == CH341_PID;
+}
+
+// FX-4CR fallback for non-CH340 bridges (CDC-ACM, CP210x, CH9102): open the
+// bridge seen during enumeration through the CDC driver.
+static esp_err_t fx_bridge_open(const cdc_acm_host_device_config_t* dev_cfg,
+                                cdc_acm_dev_hdl_t* out) {
+    if (s_vcp_vid == 0) return ESP_ERR_NOT_FOUND;
+    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID && is_legacy_ch34x_pid(s_vcp_pid)) {
+        return ch34x_vcp_open(s_vcp_pid, 0, dev_cfg, out);
+    }
+    if (s_vcp_vid == SILICON_LABS_VID) {
+        return cp210x_vcp_open(s_vcp_pid, 0, dev_cfg, out);
+    }
+    return cdc_acm_host_open(s_vcp_vid, s_vcp_pid, (uint8_t)s_vcp_iface, dev_cfg, out);
 }
 
 static void cdc_try_open(void) {
@@ -229,6 +308,17 @@ static void cdc_try_open(void) {
         } else if (err != ESP_ERR_NOT_FOUND) {
             ESP_LOGW(TAG, "CDC open QMX iface 0 failed: %s", esp_err_to_name(err));
         }
+    }
+
+    if (s_profile == UAC_PROFILE_FX4CR) {
+        // The bridge is opened per command batch (uac_cat_batch), never held.
+        // Never use CDC_HOST_ANY_* here: behind the hub it can match the codec.
+        if (s_vcp_vid != 0 && !s_fx_cat_announced) {
+            s_fx_cat_announced = true;
+            snprintf(s_cat_status, sizeof(s_cat_status), "CAT %04x:%04x", s_vcp_vid, s_vcp_pid);
+            g_cdc_initial_sync_pending = true;  // main loop syncs band + mode
+        }
+        return;
     }
 
     // Try hinted CDC interface first (if we saw class 0x02)
@@ -271,6 +361,163 @@ static void cdc_try_open(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FX-4CR: write-only CH340 CAT
+//
+// The CH340 interface has bulk IN, bulk OUT and interrupt IN; a normal claim
+// would need 3 channels with only 1 free. CAT only needs bulk OUT: with the
+// patched usb component (components/espressif__usb) the claim allocates just
+// that endpoint. The CDC driver cannot be used (it requires the interrupt
+// endpoint), so this is a minimal driver on the usb_host client API.
+// ---------------------------------------------------------------------------
+static volatile bool s_ep_filter_out_only = false;
+static usb_device_handle_t s_ep_filter_dev = NULL;
+static uint8_t s_vcp_addr = 0;
+
+// C linkage: overrides the weak default in the patched usb component.
+extern "C" bool usb_host_claim_ep_filter(usb_device_handle_t dev_hdl, const usb_ep_desc_t* ep_desc) {
+    if (!s_ep_filter_out_only || dev_hdl != s_ep_filter_dev || !ep_desc) return true;
+    return USB_EP_DESC_GET_EP_DIR(ep_desc) == 0 &&
+           USB_EP_DESC_GET_XFERTYPE(ep_desc) == USB_TRANSFER_TYPE_BULK;
+}
+
+static void fx_xfer_cb(usb_transfer_t* transfer) {
+    xSemaphoreGive(static_cast<SemaphoreHandle_t>(transfer->context));
+}
+
+static void fx_client_event_cb(const usb_host_client_event_msg_t* msg, void* arg) {
+    (void)msg;
+    (void)arg;
+}
+
+// Submit and wait, pumping this client's events (callbacks run there).
+static esp_err_t fx_run_xfer(usb_host_client_handle_t client, usb_transfer_t* xfer, bool control) {
+    SemaphoreHandle_t done = static_cast<SemaphoreHandle_t>(xfer->context);
+    esp_err_t err = control ? usb_host_transfer_submit_control(client, xfer)
+                            : usb_host_transfer_submit(xfer);
+    if (err != ESP_OK) return err;
+    for (int i = 0; i < 100; ++i) {
+        usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+        if (xSemaphoreTake(done, 0) == pdTRUE) {
+            return xfer->status == USB_TRANSFER_STATUS_COMPLETED ? ESP_OK : ESP_FAIL;
+        }
+    }
+    // Still in flight: keep pumping until the stack hands it back, so the
+    // transfer can be freed safely.
+    while (xSemaphoreTake(done, 0) != pdTRUE) {
+        usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t fx_ch340_vendor_write(usb_host_client_handle_t client, usb_device_handle_t dev,
+                                       usb_transfer_t* ctrl, uint8_t request,
+                                       uint16_t value, uint16_t index) {
+    usb_setup_packet_t* setup = reinterpret_cast<usb_setup_packet_t*>(ctrl->data_buffer);
+    setup->bmRequestType = USB_BM_REQUEST_TYPE_TYPE_VENDOR | USB_BM_REQUEST_TYPE_RECIP_DEVICE |
+                           USB_BM_REQUEST_TYPE_DIR_OUT;
+    setup->bRequest = request;
+    setup->wValue = value;
+    setup->wIndex = index;
+    setup->wLength = 0;
+    ctrl->num_bytes = sizeof(usb_setup_packet_t);
+    ctrl->device_handle = dev;
+    ctrl->bEndpointAddress = 0;
+    return fx_run_xfer(client, ctrl, true);
+}
+
+static esp_err_t fx_ch340_write(const char* const* cmds, size_t count) {
+    if (s_vcp_addr == 0) return ESP_ERR_NOT_FOUND;
+    usb_host_client_handle_t client = NULL;
+    usb_host_client_config_t ccfg = {};
+    ccfg.is_synchronous = false;
+    ccfg.max_num_event_msg = 5;
+    ccfg.async.client_event_callback = fx_client_event_cb;
+    ccfg.async.callback_arg = NULL;
+    esp_err_t err = usb_host_client_register(&ccfg, &client);
+    if (err != ESP_OK) return err;
+
+    usb_device_handle_t dev = NULL;
+    usb_transfer_t* ctrl = NULL;
+    usb_transfer_t* bulk = NULL;
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    bool claimed = false;
+    uint8_t out_ep = 0;
+    const usb_config_desc_t* cfg_desc = NULL;
+
+    err = done ? usb_host_device_open(client, s_vcp_addr, &dev) : ESP_ERR_NO_MEM;
+    if (err == ESP_OK) err = usb_host_get_active_config_descriptor(dev, &cfg_desc);
+    if (err == ESP_OK) {
+        int offset = 0;
+        const usb_intf_desc_t* intf = usb_parse_interface_descriptor(cfg_desc, 0, 0, &offset);
+        for (int i = 0; intf && i < intf->bNumEndpoints && out_ep == 0; ++i) {
+            int ep_offset = offset;
+            const usb_ep_desc_t* ep = usb_parse_endpoint_descriptor_by_index(
+                intf, i, cfg_desc->wTotalLength, &ep_offset);
+            if (ep && USB_EP_DESC_GET_EP_DIR(ep) == 0 &&
+                USB_EP_DESC_GET_XFERTYPE(ep) == USB_TRANSFER_TYPE_BULK) {
+                out_ep = ep->bEndpointAddress;
+            }
+        }
+        if (out_ep == 0) err = ESP_ERR_NOT_FOUND;
+    }
+    if (err == ESP_OK) {
+        s_ep_filter_dev = dev;
+        s_ep_filter_out_only = true;
+        err = usb_host_interface_claim(client, dev, 0, 0);
+        s_ep_filter_out_only = false;
+        claimed = (err == ESP_OK);
+    }
+    if (err == ESP_OK) err = usb_host_transfer_alloc(64, 0, &ctrl);
+    if (err == ESP_OK) err = usb_host_transfer_alloc(64, 0, &bulk);
+    if (err == ESP_OK) {
+        ctrl->callback = fx_xfer_cb;
+        ctrl->context = done;
+        ctrl->timeout_ms = 500;
+        bulk->callback = fx_xfer_cb;
+        bulk->context = done;
+        bulk->timeout_ms = 500;
+        bulk->device_handle = dev;
+        bulk->bEndpointAddress = out_ep;
+        // 115200 8N1 (values from the espressif CH34x driver's divisor math),
+        // then DTR/RTS inactive: RTS is PTT on the F5BUD firmware.
+        err = fx_ch340_vendor_write(client, dev, ctrl, 0x9A, 0x1312, 0xCC83);
+        if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0x9A, 0x2518, 0x00C3);
+        if (err == ESP_OK) err = fx_ch340_vendor_write(client, dev, ctrl, 0xA4, 0x0060, 0);
+    }
+    // Reprogramming the UART can put a glitch byte on the line, which would
+    // make the radio reject the first command. Let the line settle, then
+    // send ';' to flush the radio's command parser.
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        bulk->data_buffer[0] = ';';
+        bulk->num_bytes = 1;
+        err = fx_run_xfer(client, bulk, false);
+    }
+    for (size_t i = 0; err == ESP_OK && i < count; ++i) {
+        const size_t len = strlen(cmds[i]);
+        if (len > bulk->data_buffer_size) {
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        // Give the radio time to act on each command: right after MD/DA it
+        // drops a TX1; that follows immediately.
+        if (i > 0) vTaskDelay(pdMS_TO_TICKS(15));
+        memcpy(bulk->data_buffer, cmds[i], len);
+        bulk->num_bytes = (int)len;
+        err = fx_run_xfer(client, bulk, false);
+    }
+    if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(10));  // UART drains the last bytes
+
+    if (ctrl) usb_host_transfer_free(ctrl);
+    if (bulk) usb_host_transfer_free(bulk);
+    if (claimed) usb_host_interface_release(client, dev, 0);
+    if (dev) usb_host_device_close(client, dev);
+    usb_host_client_deregister(client);
+    if (done) vSemaphoreDelete(done);
+    return err;
+}
+
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
     usb_device_info_t info = {};
     if (usb_host_device_info(usb_dev, &info) == ESP_OK) {
@@ -282,6 +529,10 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
         ESP_LOGI(TAG, "USB dev attached: VID:0x%04x PID:0x%04x cfgs:%u",
                  dev_desc->idVendor, dev_desc->idProduct, dev_desc->bNumConfigurations);
     }
+
+    bool has_audio = false;
+    int comm_iface = -1;
+    int vendor_iface = -1;
 
     const usb_config_desc_t* cfg = nullptr;
     if (usb_host_get_active_config_descriptor(usb_dev, &cfg) == ESP_OK && cfg) {
@@ -301,8 +552,31 @@ static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
                     s_cdc_iface_hint = intf->bInterfaceNumber;
                     ESP_LOGI(TAG, "  -> CDC candidate iface %d", s_cdc_iface_hint);
                 }
+                if (intf->bInterfaceClass == USB_CLASS_AUDIO) has_audio = true;
+                if (intf->bInterfaceClass == USB_CLASS_COMM && comm_iface < 0) {
+                    comm_iface = intf->bInterfaceNumber;
+                }
+                if (intf->bInterfaceClass == USB_CLASS_VENDOR_SPEC && vendor_iface < 0) {
+                    vendor_iface = intf->bInterfaceNumber;
+                }
             }
             offset += len;
+        }
+    }
+
+    // Remember the serial bridge: not the codec, not a hub, and either a known
+    // bridge VID or a CDC / vendor-specific interface.
+    if (dev_desc && !has_audio && dev_desc->bDeviceClass != USB_CLASS_HUB) {
+        const bool known_vid = dev_desc->idVendor == NANJING_QINHENG_MICROE_VID ||
+                               dev_desc->idVendor == SILICON_LABS_VID;
+        if (known_vid || comm_iface >= 0 || vendor_iface >= 0) {
+            s_vcp_vid = dev_desc->idVendor;
+            s_vcp_pid = dev_desc->idProduct;
+            s_vcp_addr = info.dev_addr;
+            s_vcp_iface = comm_iface >= 0 ? comm_iface : (vendor_iface >= 0 ? vendor_iface : 0);
+            snprintf(s_cat_status, sizeof(s_cat_status), "CAT seen %04x:%04x",
+                     s_vcp_vid, s_vcp_pid);
+            ESP_LOGI(TAG, "  -> USB-serial bridge candidate iface %d", s_vcp_iface);
         }
     }
 }
@@ -350,7 +624,7 @@ static void usb_lib_task(void* arg) {
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
 
-    if (s_profile == UAC_PROFILE_QMX) {
+    if (profile_has_cat_and_tx_audio(s_profile)) {
         // Custom FIFO partitioning enables simultaneous bidirectional ISO
         // streaming with QDX or QMX hardware. ESP32-S3 has 200 FIFO lines.
         // Built-in Kconfig biases do not cover 24-bit/48k/stereo MPS=300
@@ -376,8 +650,8 @@ static void usb_lib_task(void* arg) {
 
     ESP_LOGI(TAG, "USB Host installed");
 
-    if (s_profile == UAC_PROFILE_QMX) {
-        // Install CDC-ACM driver for QMX/QDX CAT control before starting class drivers.
+    if (profile_has_cat_and_tx_audio(s_profile)) {
+        // Install CDC-ACM driver for QMX/QDX/FX-4CR CAT control before starting class drivers.
         const cdc_acm_host_driver_config_t cdc_cfg = {
             .driver_task_stack_size = 3072,
             .driver_task_priority = 4,
@@ -438,6 +712,15 @@ static void usb_lib_task(void* arg) {
     vTaskDelete(NULL);
 }
 
+// FX-4CR: the radio's CSR Bluetooth module (0a12:4007) is also a UAC
+// device. Only the C-Media codec carries the radio's USB audio.
+static bool is_fx4cr_bluetooth_audio(uac_host_device_handle_t handle) {
+    if (s_profile != UAC_PROFILE_FX4CR || !handle) return false;
+    uac_host_dev_info_t info = {};
+    if (uac_host_get_device_info(handle, &info) != ESP_OK) return false;
+    return info.VID == 0x0A12;
+}
+
 // UAC class driver task
 static void uac_lib_task(void* arg) {
     // Wait for USB host to be ready
@@ -496,6 +779,11 @@ static void uac_lib_task(void* arg) {
                         snprintf(s_status_string, sizeof(s_status_string), "Open failed");
                         continue;
                     }
+                    if (is_fx4cr_bluetooth_audio(handle)) {
+                        ESP_LOGI(TAG, "Ignoring Bluetooth module mic addr:%d", evt.driver.addr);
+                        uac_host_device_close(handle);
+                        continue;
+                    }
 
                     // Print device info
                     uac_host_printf_device_param(handle);
@@ -513,7 +801,8 @@ static void uac_lib_task(void* arg) {
                         candidates[candidate_count].flags = 0;
                         candidate_count++;
                     };
-                    if (s_profile == UAC_PROFILE_GENERIC_USB) {
+                    if (s_profile == UAC_PROFILE_GENERIC_USB ||
+                        s_profile == UAC_PROFILE_FX4CR) {
                         add_candidate(1, 24);
                         add_candidate(1, 16);
                         add_candidate(2, 24);
@@ -542,7 +831,7 @@ static void uac_lib_task(void* arg) {
                     }
 
                     if (!started) {
-                        if (s_profile == UAC_PROFILE_GENERIC_USB) {
+                        if (s_profile != UAC_PROFILE_QMX) {
                             ESP_LOGE(TAG, "No 48k UAC mic format for profile=%s",
                                      profile_name(s_profile));
                             snprintf(s_status_string, sizeof(s_status_string), "No 48k UAC mic format");
@@ -565,8 +854,8 @@ static void uac_lib_task(void* arg) {
                              s_format.bit_resolution,
                              s_format.channels);
 
-                    if (s_profile == UAC_PROFILE_QMX) {
-                        // Try to open companion CDC-ACM interface (CAT).
+                    if (profile_has_cat_and_tx_audio(s_profile)) {
+                        // Try to open companion CAT serial interface.
                         cdc_try_open();
                     }
 
@@ -612,7 +901,7 @@ static void uac_lib_task(void* arg) {
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
-                    if (s_profile != UAC_PROFILE_QMX) {
+                    if (!profile_has_cat_and_tx_audio(s_profile)) {
                         ESP_LOGI(TAG, "Speaker connected ignored profile=%s addr=%u iface=%u",
                                  profile_name(s_profile),
                                  (unsigned)evt.driver.addr,
@@ -620,6 +909,12 @@ static void uac_lib_task(void* arg) {
                         continue;
                     }
 
+                    if (s_profile == UAC_PROFILE_FX4CR && s_spk_known) {
+                        // e.g. the FX-4CR Bluetooth module's speaker
+                        ESP_LOGI(TAG, "Additional speaker ignored addr=%u",
+                                 (unsigned)evt.driver.addr);
+                        continue;
+                    }
                     s_spk_addr  = evt.driver.addr;
                     s_spk_iface = evt.driver.iface_num;
                     s_spk_known = true;
@@ -629,13 +924,22 @@ static void uac_lib_task(void* arg) {
                     // is contiguous, then hold it across all TX cycles.
                     if (!s_spk_handle) {
                         uac_host_device_config_t cfg = {};
+                        uac_host_device_handle_t probe = NULL;
                         cfg.addr = s_spk_addr;
                         cfg.iface_num = s_spk_iface;
                         cfg.buffer_size = SPK_BUFFER_SIZE;
                         cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
                         cfg.callback = spk_event_cb;
                         cfg.callback_arg = nullptr;
-                        esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
+                        esp_err_t oerr = uac_host_device_open(&cfg, &probe);
+                        if (oerr == ESP_OK && is_fx4cr_bluetooth_audio(probe)) {
+                            ESP_LOGI(TAG, "Ignoring Bluetooth module speaker addr=%u",
+                                     (unsigned)s_spk_addr);
+                            uac_host_device_close(probe);
+                            s_spk_known = false;
+                            continue;
+                        }
+                        s_spk_handle = probe;
                         if (oerr != ESP_OK) {
                             ESP_LOGE(TAG, "spk pre-open failed at enum: %s",
                                      esp_err_to_name(oerr));
@@ -652,19 +956,41 @@ static void uac_lib_task(void* arg) {
                             // via uac_host_device_resume (cheap, no
                             // realloc). Suspend at TX-end stops URB flow
                             // but keeps everything allocated.
-                            uac_host_stream_config_t scfg = {};
-                            scfg.channels = 2;
-                            scfg.bit_resolution = 24;
-                            scfg.sample_freq = 48000;
-                            scfg.flags = FLAG_STREAM_SUSPEND_AFTER_START;
-                            esp_err_t serr = uac_host_device_start(s_spk_handle, &scfg);
+                            // QMX/QDX: 24-bit stereo only. FX-4CR (C-Media):
+                            // usually 16-bit stereo; try the common layouts.
+                            static const uint8_t k_spk_fmt_qmx[][2] = {{2, 24}};
+                            static const uint8_t k_spk_fmt_fx4cr[][2] = {
+                                {2, 16}, {1, 16}, {2, 24}, {1, 24}};
+                            const bool fx = (s_profile == UAC_PROFILE_FX4CR);
+                            const uint8_t (*fmts)[2] = fx ? k_spk_fmt_fx4cr : k_spk_fmt_qmx;
+                            const int fmt_count = fx ? 4 : 1;
+                            esp_err_t serr = ESP_FAIL;
+                            if (s_spk_swap_mode) {
+                                // Opened only; claimed per TX (see s_spk_swap_mode).
+                                serr = ESP_OK;
+                            }
+                            for (int f = 0; f < fmt_count && serr != ESP_OK; ++f) {
+                                uac_host_stream_config_t scfg = {};
+                                scfg.channels = fmts[f][0];
+                                scfg.bit_resolution = fmts[f][1];
+                                scfg.sample_freq = 48000;
+                                scfg.flags = FLAG_STREAM_SUSPEND_AFTER_START;
+                                serr = uac_host_device_start(s_spk_handle, &scfg);
+                                if (serr == ESP_OK) {
+                                    s_spk_channels = scfg.channels;
+                                    s_spk_bits = scfg.bit_resolution;
+                                    ESP_LOGI(TAG, "Speaker format 48k/%u-bit/%uch",
+                                             (unsigned)s_spk_bits, (unsigned)s_spk_channels);
+                                }
+                            }
                             if (serr != ESP_OK) {
                                 ESP_LOGE(TAG, "spk pre-start failed at enum: %s",
                                          esp_err_to_name(serr));
                                 uac_host_device_close(s_spk_handle);
                                 s_spk_handle = NULL;
                             } else {
-                                ESP_LOGI(TAG, "Speaker pre-opened+claimed (handle=%p, ringbuf=%u B, suspended)",
+                                ESP_LOGI(TAG, "Speaker pre-opened%s (handle=%p, ringbuf=%u B)",
+                                         s_spk_swap_mode ? ", claimed per TX" : "+claimed, suspended",
                                          s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
                                 // Allocate the pump buffer + permanent
                                 // writer task NOW too, while heap is
@@ -763,13 +1089,29 @@ static int uac_read_ft8_samples(void* ctx, float* out, int max_samples) {
     if (!usb_buffer || !out) return 0;
 
     while (!s_stop_requested && s_mic_handle != NULL) {
+        if (s_mic_paused) {
+            vTaskDelay(pdMS_TO_TICKS(20));  // FX-4CR TX: mic released
+            continue;
+        }
         uint32_t bytes_read = 0;
         esp_err_t ret = uac_host_device_read(s_mic_handle, usb_buffer,
                                               UAC_READ_BUFFER_SIZE,
                                               &bytes_read,
                                               pdMS_TO_TICKS(200));
         if (ret != ESP_OK || bytes_read == 0) {
-            if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
+            if (ret == ESP_ERR_INVALID_STATE) {
+                vTaskDelay(pdMS_TO_TICKS(20));  // stream not active (FX-4CR TX/CAT)
+                // Safety net: a failed restart must not freeze RX for good.
+                static int64_t last_retry_ms = 0;
+                const int64_t now = rtc_now_ms();
+                if (s_mic_restart_needed && !s_spk_writer_run && now - last_retry_ms > 1000 &&
+                    s_cat_lock && xSemaphoreTake(s_cat_lock, 0) == pdTRUE) {
+                    last_retry_ms = now;
+                    s_mic_paused = true;  // mic_resume_after_tx() acts only when paused
+                    mic_resume_after_tx();
+                    xSemaphoreGive(s_cat_lock);
+                }
+            } else if (ret != ESP_ERR_TIMEOUT && ret != ESP_FAIL) {
                 ESP_LOGW(TAG, "USB read error: %s", esp_err_to_name(ret));
             }
             continue;
@@ -844,6 +1186,21 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_cdc_last_attempt_ms = 0;
     s_cdc_iface = -1;
     s_cdc_iface_hint = -1;
+    s_vcp_vid = 0;
+    s_vcp_pid = 0;
+    s_vcp_iface = 0;
+    s_vcp_addr = 0;
+    s_fx_cat_announced = false;
+    s_cat_fail_ms = 0;
+    s_cat_fail_count = 0;
+    if (!s_cat_lock) s_cat_lock = xSemaphoreCreateMutex();
+    snprintf(s_cat_status, sizeof(s_cat_status), "CAT none");
+    s_spk_bits = 24;
+    s_spk_channels = 2;
+    s_spk_swap_mode = (profile == UAC_PROFILE_FX4CR);
+    s_spk_fmt_known = false;
+    s_mic_paused = false;
+    s_mic_restart_needed = false;
     s_format.sample_freq = UAC_SAMPLE_RATE;
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
@@ -948,14 +1305,16 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
 
 static void spk_writer_task(void* /*arg*/) {
     // Permanent task, gated per transmission. The DDS owns symbol timing.
-    const uint32_t frames_per_block = SPK_PUMP_BYTES / SPK_FRAME_BYTES;  // 2304
     while (!s_spk_writer_stop) {
         if (!s_spk_writer_run) {
             // Idle between TX cycles. Sleep cheaply.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        dds_render_24bit_stereo(s_spk_pump_buf, frames_per_block);
+        // Read per block: in swap mode the format is negotiated at TX start.
+        const uint32_t frame_bytes = (s_spk_bits / 8u) * s_spk_channels;
+        const uint32_t frames_per_block = SPK_PUMP_BYTES / frame_bytes;
+        dds_render_pcm(s_spk_pump_buf, frames_per_block, s_spk_bits, s_spk_channels);
         esp_err_t err = uac_host_device_write(s_spk_handle, s_spk_pump_buf, SPK_PUMP_BYTES,
                                               pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
         if (err == ESP_OK) {
@@ -975,6 +1334,87 @@ static void spk_writer_task(void* /*arg*/) {
     vTaskDelete(NULL);
 }
 
+// Stop a UAC stream and really release its interface (= its host channel).
+// uac_host_device_stop() suspends, then releases. The release is refused
+// (ESP_ERR_INVALID_STATE) while the just-cancelled ISO transfers are still
+// in flight / unprocessed by the UAC client task, leaving the channel
+// claimed (field logs, mic and speaker alike). Retry: once suspended, a
+// further call only releases, which succeeds after the transfers drain.
+static esp_err_t uac_stop_and_release(uac_host_device_handle_t handle, const char* what) {
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        err = uac_host_device_stop(handle);
+        if (err == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s stop failed: %s", what, esp_err_to_name(err));
+    }
+    return err;
+}
+
+// Stop the mic stream to free its host channel (FX-4CR TX / CAT batch).
+static void mic_pause_for_usb(void) {
+    if (s_mic_paused || !s_mic_handle) return;
+    s_mic_paused = true;
+    uac_stop_and_release(s_mic_handle, "mic");
+}
+
+static void mic_resume_after_tx(void) {
+    if (!s_mic_paused) return;
+    if (s_mic_handle) {
+        uac_host_stream_config_t mcfg = {};
+        mcfg.channels = s_format.channels;
+        mcfg.bit_resolution = s_format.bit_resolution;
+        mcfg.sample_freq = s_format.sample_freq;
+        mcfg.flags = 0;
+        esp_err_t err = uac_host_device_start(s_mic_handle, &mcfg);
+        // start() returns OK without streaming if a failed stop left the
+        // interface claimed but suspended (READY); resume() covers that and
+        // is a no-op when already ACTIVE.
+        if (err == ESP_OK) err = uac_host_device_resume(s_mic_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "mic restart after TX failed: %s", esp_err_to_name(err));
+        }
+        s_mic_restart_needed = (err != ESP_OK);  // read loop retries
+    }
+    s_mic_paused = false;
+}
+
+// Swap mode TX start: release the mic's channel, then claim the speaker.
+static bool spk_swap_start(void) {
+    mic_pause_for_usb();  // may already be paused by the TX; CAT batch
+
+    static const uint8_t k_fmts[][2] = {{2, 16}, {1, 16}, {2, 24}, {1, 24}};
+    esp_err_t serr = ESP_FAIL;
+    // Last good format first, then the common C-Media layouts.
+    for (int f = -1; f < 4 && serr != ESP_OK; ++f) {
+        if (f == -1 && !s_spk_fmt_known) continue;
+        uac_host_stream_config_t scfg = {};
+        scfg.channels = (f == -1) ? s_spk_channels : k_fmts[f][0];
+        scfg.bit_resolution = (f == -1) ? s_spk_bits : k_fmts[f][1];
+        scfg.sample_freq = 48000;
+        scfg.flags = 0;
+        serr = uac_host_device_start(s_spk_handle, &scfg);
+        if (serr == ESP_OK) {
+            s_spk_channels = scfg.channels;
+            s_spk_bits = scfg.bit_resolution;
+            if (!s_spk_fmt_known) {
+                ESP_LOGI(TAG, "Speaker format 48k/%u-bit/%uch",
+                         (unsigned)s_spk_bits, (unsigned)s_spk_channels);
+            }
+            s_spk_fmt_known = true;
+        }
+    }
+    if (serr != ESP_OK) {
+        ESP_LOGE(TAG, "UAC OUT start failed: %s", esp_err_to_name(serr));
+        mic_resume_after_tx();
+        return false;
+    }
+    s_spk_writer_run = true;
+    return true;
+}
+
 static bool uac_tx_start_writer(void) {
     if (s_spk_writer_run) {
         ESP_LOGW(TAG, "UAC OUT already active");
@@ -987,6 +1427,10 @@ static bool uac_tx_start_writer(void) {
 
     s_spk_packets_sent = 0;
     s_spk_write_errors = 0;
+
+    if (s_spk_swap_mode) {
+        return spk_swap_start();
+    }
 
     esp_err_t err = uac_host_device_resume(s_spk_handle);
     if (err != ESP_OK) {
@@ -1037,6 +1481,10 @@ bool uac_tx_begin_tune(float tone_hz) {
 }
 
 void uac_tx_end(void) {
+    uac_tx_end_ex(true);
+}
+
+void uac_tx_end_ex(bool resume_rx) {
     if (!s_spk_writer_run) {
         dds_cpfsk_end();
         dds_set_freq_hz(0.0);
@@ -1049,7 +1497,12 @@ void uac_tx_end(void) {
     dds_set_freq_hz(0.0);
 
     if (s_spk_handle) {
-        uac_host_device_suspend(s_spk_handle);
+        if (s_spk_swap_mode) {
+            uac_stop_and_release(s_spk_handle, "speaker");  // free the channel
+            if (resume_rx) mic_resume_after_tx();
+        } else {
+            uac_host_device_suspend(s_spk_handle);
+        }
     }
 
     ESP_LOGI(TAG, "UAC OUT stopped packets=%u errors=%u",
@@ -1068,11 +1521,91 @@ const char* uac_get_debug_line2(void) {
     return s_debug_line2;
 }
 
+const char* uac_get_cat_status(void) {
+    return s_cat_status;
+}
+
 bool cat_cdc_ready(void) {
+    if (s_profile == UAC_PROFILE_FX4CR) return s_fx_cat_announced;
     return s_cdc_handle != NULL;
 }
 
+void uac_rx_resume(void) {
+    mic_resume_after_tx();
+}
+
+esp_err_t uac_cat_batch(const char* const* cmds, size_t count, bool resume_rx) {
+    return uac_cat_batch_ex(cmds, count, resume_rx, false);
+}
+
+esp_err_t uac_cat_batch_ex(const char* const* cmds, size_t count, bool resume_rx, bool urgent) {
+    if (s_profile != UAC_PROFILE_FX4CR) {
+        esp_err_t err = ESP_OK;
+        for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+            err = cat_cdc_send(reinterpret_cast<const uint8_t*>(cmds[i]), strlen(cmds[i]), 200);
+        }
+        return err;
+    }
+    if (!s_cdc_installed || s_vcp_vid == 0) return ESP_ERR_INVALID_STATE;
+    if (s_spk_writer_run) return ESP_ERR_INVALID_STATE;  // speaker holds a channel
+    // Every burst pauses RX audio; a failing link retried often makes the
+    // waterfall choppy and kills decodes. Back off 3, 6, 12, 24 s ... 60 s.
+    if (s_cat_fail_count > 0 && !urgent) {
+        int64_t backoff_ms = 3000LL << (s_cat_fail_count > 5 ? 5 : s_cat_fail_count - 1);
+        if (backoff_ms > 60000) backoff_ms = 60000;
+        if (rtc_now_ms() - s_cat_fail_ms < backoff_ms) return ESP_ERR_INVALID_STATE;
+    }
+    if (s_cat_lock) xSemaphoreTake(s_cat_lock, portMAX_DELAY);
+
+    mic_pause_for_usb();
+    esp_err_t err;
+    if (s_vcp_vid == NANJING_QINHENG_MICROE_VID && is_legacy_ch34x_pid(s_vcp_pid)) {
+        err = fx_ch340_write(cmds, count);
+    } else {
+        cdc_acm_host_device_config_t dev_cfg = {
+            .connection_timeout_ms = 500,
+            .out_buffer_size = 64,
+            .in_buffer_size = 0,
+            .event_cb = NULL,
+            .data_cb = NULL,
+            .user_arg = NULL,
+        };
+        cdc_acm_dev_hdl_t h = NULL;
+        err = fx_bridge_open(&dev_cfg, &h);
+        if (err == ESP_OK) {
+            cdc_configure_fx4cr_line(h);
+            for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+                err = cdc_acm_host_data_tx_blocking(h, reinterpret_cast<const uint8_t*>(cmds[i]),
+                                                    strlen(cmds[i]), 200);
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));  // let the bridge shift the last bytes out
+            cdc_acm_host_close(h);
+        }
+    }
+    if (err == ESP_OK) {
+        snprintf(s_cat_status, sizeof(s_cat_status), "CAT ok %04x:%04x", s_vcp_vid, s_vcp_pid);
+        s_cat_fail_ms = 0;
+        s_cat_fail_count = 0;
+    } else {
+        snprintf(s_cat_status, sizeof(s_cat_status), "CATerr %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "FX-4CR CAT burst failed: %s", esp_err_to_name(err));
+        s_cat_fail_ms = rtc_now_ms();
+        s_cat_fail_count++;
+    }
+    if (resume_rx) mic_resume_after_tx();
+    if (s_cat_lock) xSemaphoreGive(s_cat_lock);
+    return err;
+}
+
 esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms) {
+    if (s_profile == UAC_PROFILE_FX4CR) {
+        char cmd[64];
+        if (len >= sizeof(cmd)) return ESP_ERR_INVALID_SIZE;
+        memcpy(cmd, data, len);
+        cmd[len] = '\0';
+        const char* one[] = {cmd};
+        return uac_cat_batch(one, 1, true);
+    }
     if (!s_cdc_handle) {
         return ESP_ERR_INVALID_STATE;
     }

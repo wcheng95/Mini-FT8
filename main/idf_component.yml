@@ -17,8 +17,14 @@ dependencies:
   lvgl/lvgl: ^8.3.9
   # USB Host UAC for audio streaming
   espressif/usb_host_uac: ^1.2.0
-  espressif/usb: '*'
+  # Local copy with the Mini-FT8 endpoint-filter patch (components/espressif__usb/MINI_FT8_PATCH.md)
+  espressif/usb:
+    version: '*'
+    override_path: '../components/espressif__usb'
   # USB Host CDC for CAT
   espressif/usb_host_cdc_acm: ^2.2.0
+  # Vendor USB-serial bridges for CAT (FX-4CR bridge, truSDX CH340G)
+  espressif/usb_host_ch34x_vcp: ^2.2.1
+  espressif/usb_host_cp210x_vcp: ^2.2.0
   # Cardputer-Adv ES8311 mic capture
   espressif/esp_codec_dev: ^1.5.9

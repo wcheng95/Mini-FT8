@@ -25,6 +25,11 @@ void dds_cpfsk_end(void);
 // Render packed 24-bit stereo PCM (six bytes per frame).
 void dds_render_24bit_stereo(uint8_t* out, unsigned frames);
 
+// Render packed little-endian PCM at DDS_FS_HZ. bit_resolution is 16 or 24,
+// channels is 1 or 2; every channel carries the same sample.
+void dds_render_pcm(uint8_t* out, unsigned frames,
+                    unsigned bit_resolution, unsigned channels);
+
 #ifdef __cplusplus
 }
 #endif
